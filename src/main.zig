@@ -3,73 +3,128 @@ const stbi = @cImport({
     @cInclude("stb_image.h");
 });
 
-const Image = struct {
-    data: []u8,
-    width: usize,
-    height: usize,
+const StbiImage = struct {
+    inner: Image(u8),
 
-
-    fn load() !Image {
-        var widthi: c_int = undefined;
-        var heighti: c_int = undefined;
-        // FIXME: Leakies :)
-        const data = stbi.stbi_load("untitled3.png", &widthi, &heighti, null, 1);
-
-        if (data == null) return error.LoadFailed;
-
-        const width: usize = @intCast(widthi);
-        const height: usize = @intCast(heighti);
-
-        return .{
-            .data = data[0..width * height],
-            .width = width,
-            .height = height,
-        };
-    }
-
-    fn dupe(self: Image, alloc: std.mem.Allocator) !Image {
-        return .{
-            .data = try alloc.dupe(u8, self.data),
-            .width = self.width,
-            .height = self.height,
-        };
+    fn deinit(self: StbiImage) void {
+        stbi.stbi_image_free(self.inner.data.ptr);
     }
 };
 
-const BarcodePreprocessor = struct {
-    threshold: u16 = 70,
-    in: Image,
-    out: Image,
+// FIXME: Generalized image kernel
 
-    fn init(alloc: std.mem.Allocator, image: Image) !BarcodePreprocessor {
+fn loadImage(path: [:0]const u8) !StbiImage {
+    var widthi: c_int = undefined;
+    var heighti: c_int = undefined;
+
+    const data = stbi.stbi_load(path, &widthi, &heighti, null, 1);
+    errdefer stbi.stbi_image_free(data);
+
+    if (data == null) return error.LoadFailed;
+
+    const width: u31 = @intCast(widthi);
+    const height: u31 = @intCast(heighti);
+
+    return .{
+        .inner = .{
+            .data = data[0..width * height],
+            .width = width,
+        },
+    };
+}
+
+pub fn ImageKernel(comptime T: type, size: comptime_int) type {
+    std.debug.assert(size % 2 == 1);
+
+    return struct {
+        inner: [size * size]T,
+
+        const Self = @This();
+        fn apply(self: Self, image: anytype, x: u31, y: u31) T {
+            const image_height = image.calcHeight();
+            var total: T = 0;
+            for (0..size) |kernel_y| {
+                const image_y = kernelToImagePos(y, image_height, @intCast(kernel_y));
+                for (0..size) |kernel_x| {
+                    const image_x = kernelToImagePos(x, image.width, @intCast(kernel_x));
+
+                    const mul = self.inner[kernel_y * size + kernel_x];
+                    const source = image.data[image_y * image.width + image_x];
+                    total += mul * source;
+                }
+            }
+
+            return total;
+        }
+
+        fn kernelToImagePos(center: u31, image_max: u31, kernel_pos: u31) u31 {
+            const kernel_center = size / 2;
+            if (center < kernel_center) return 0;
+            if (center >= image_max - kernel_center) return image_max - 1;
+
+            return center + kernel_pos - kernel_center;
+        }
+    };
+}
+
+pub fn Image(comptime T: type) type {
+    return struct {
+        data: []T,
+        width: u31,
+
+        const Self = @This();
+
+        fn init(alloc: std.mem.Allocator, width: u31, height: u31) !Self {
+            return .{
+                .data = try alloc.alloc(T, width * height),
+                .width = width,
+            };
+        }
+
+        fn calcHeight(self: Self) u31 {
+            return @intCast(self.data.len / self.width);
+        }
+
+        fn dupe(self: Image(u8), alloc: std.mem.Allocator) !Image(u8) {
+            return .{
+                .data = try alloc.dupe(u8, self.data),
+                .width = self.width,
+            };
+        }
+    };
+}
+
+const BarcodePreprocessor = struct {
+    threshold: u16 = 120,
+    in: Image(u8),
+    out: Image(u1),
+
+    fn init(alloc: std.mem.Allocator, image: Image(u8)) !BarcodePreprocessor {
         return .{
             .in = image,
-            .out = try image.dupe(alloc),
+            .out = try .init(alloc, image.width, image.calcHeight()),
         };
-
     }
 
     fn process(self: BarcodePreprocessor) !void {
-
-        for (0..self.in.height) |y| {
+        for (0..self.in.calcHeight()) |y| {
             for (0..self.in.width) |x| {
-                self.processPixelWBlur(x, y);
+                self.processPixelWBlur(@intCast(x), @intCast(y));
             }
         }
     }
 
-    fn processPixelWBlur(self: BarcodePreprocessor, x: usize, y: usize) void {
+    fn processPixelWBlur(self: BarcodePreprocessor, x: u31, y: u31) void {
         if (x < 2 or x > self.in.width - 2) return;
-        if (y < 2 or y > self.in.height - 2) return;
+        if (y < 2 or y > self.in.calcHeight() - 2) return;
 
-        var total: u16 = 0;
-        for (y - 2..y+2) |iy| {
-            for (x-2..x+2) |ix| {
-                total += self.in.data[iy * self.in.width + ix];
-            }
-        }
+        const kernel = ImageKernel(u16, 5){
+            .inner = @splat(1),
+        };
 
-        const out_val: u8 = if (total > self.threshold * 25) 255 else 0;
+        const total = kernel.apply(self.in, x, y);
+
+        const out_val: u1 = if (total > self.threshold * 25) 1 else 0;
         self.out.data[y * self.in.width + x] = out_val;
     }
 
@@ -81,7 +136,8 @@ const BarcodePreprocessor = struct {
 };
 
 const BarcodeScanner = struct {
-    image: Image,
+    image: Image(u1),
+    debug: Image(DebugPurpose),
     tolerance: u31 = 2,
 
     const upca_width_modules = 95;
@@ -103,9 +159,8 @@ const BarcodeScanner = struct {
         .{3, 1, 1, 2},
     };
 
-    fn parseLeft(self: BarcodeScanner, y: usize) ?HalfUpcCode {
-        var x, const module_width_u = (self.findStart(y) orelse return null);
-        const module_width: i32 = @intCast(module_width_u);
+    fn parseLeft(self: BarcodeScanner, y: u31) ?HalfUpcCode {
+        var x, const module_width = (self.findStart(y) orelse return null);
         var ret: HalfUpcCode = undefined;
         for (0..6) |i| {
             if (self.readNumberLeft(&x, y, module_width)) |num| {
@@ -133,7 +188,7 @@ const BarcodeScanner = struct {
         //
     }
 
-    fn readNumberLeft(self: BarcodeScanner, x: *usize, y: usize, module_width: i32) ?u8 {
+    fn readNumberLeft(self: BarcodeScanner, x: *u31, y: u31, module_width: i32) ?u8 {
         const a = self.countLight(x, y);
         const b = self.countDark(x, y);
         const c = self.countLight(x, y);
@@ -162,18 +217,21 @@ const BarcodeScanner = struct {
         return null;
     }
 
-    fn findStart(self: BarcodeScanner, y: usize) ?struct{usize, usize} {
-        for (0..self.image.width) |x| {
+    fn findStart(self: BarcodeScanner, y: u31) ?struct{u31, u31} {
+        for (0..self.image.width) |x_us| {
+            const x: u31 = @intCast(x_us);
             const module_width = self.isStartEndSequence(x, y) orelse continue;
             const expected_end_start = ((upca_width_modules - start_end_width_modules) * module_width) + x;
 
-            var offs: i32 = -5;
-            while (offs < 5) {
-                defer offs += 1;
+            const offs_start = @min(expected_end_start -| 5, self.image.width);
+            const offs_end = @min(expected_end_start + 5, self.image.width);
 
-                if (self.isStartEndSequence(@intCast(@as(i32, @intCast(expected_end_start)) + offs), y)) |_| {
-                    //std.debug.print("Found start with width {d} at {d}\n" ,.{module_width, x});
-                    return .{x + module_width * 4, module_width};
+            for (offs_start..offs_end) |end_test_x_us| {
+                const end_test_x: u31 = @intCast(end_test_x_us);
+                if (self.isStartEndSequence(end_test_x, y)) |_| {
+                    const out_x = x + module_width * 4;
+                    self.debug.data[y * self.debug.width + out_x] = .barcode_start;
+                    return .{out_x, module_width};
                 }
             }
         }
@@ -182,7 +240,7 @@ const BarcodeScanner = struct {
     }
 
     // return module width if sequence is found
-    fn isStartEndSequence(self: BarcodeScanner, x: usize, y: usize) ?usize {
+    fn isStartEndSequence(self: BarcodeScanner, x: u31, y: u31) ?u31 {
         var it = x;
 
         const start = self.countLight(&it, y);
@@ -198,13 +256,14 @@ const BarcodeScanner = struct {
         if (c == 0) return null;
 
         if (@abs(a - b) < self.tolerance and @abs(a - c) < self.tolerance) {
+            self.debug.data[y * self.debug.width + x] = .potential_barcode_start;
             return @intCast(a);
         }
 
         return null;
     }
 
-    fn countDark(self: BarcodeScanner, x: *usize, y: usize) i32 {
+    fn countDark(self: BarcodeScanner, x: *u31, y: u31) i32 {
         const start_x = x.*;
         while (x.* < self.image.width) {
             defer x.* += 1;
@@ -217,7 +276,7 @@ const BarcodeScanner = struct {
     }
 
     // FIXME: hella duped with countDark but whatever
-    fn countLight(self: BarcodeScanner, x: *usize, y: usize) i32 {
+    fn countLight(self: BarcodeScanner, x: *u31, y: u31) i32 {
         const start_x = x.*;
         while (x.* < self.image.width) {
             defer x.* += 1;
@@ -230,51 +289,91 @@ const BarcodeScanner = struct {
     }
 };
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
 
-    const image = try Image.load();
+const DebugPurpose = enum {
+    none,
+    barcode_start,
+    potential_barcode_start,
+};
 
-    const processor = try BarcodePreprocessor.init(arena.allocator(), image);
-    try processor.process();
+fn writePpm(image: Image(u1), debug: Image(DebugPurpose)) !void {
+    std.debug.assert(image.width == debug.width);
+    std.debug.assert(image.data.len == debug.data.len);
 
     var ppm = try std.fs.cwd().createFile("out.ppm", .{});
     defer ppm.close();
 
     var ppm_writer = ppm.writer();
-
-    const scanner = BarcodeScanner {
-        .image = processor.out,
-    };
-
     try ppm_writer.print(
         \\P6
         \\{d} {d}
         \\255
         \\
-    , .{processor.out.width, processor.out.height});
+    , .{image.width, image.calcHeight()});
 
-
-    for (0..image.height) |y| {
-        const start = scanner.findStart(y);
-        _ = scanner.parseLeft(y);
+    for (0..image.calcHeight()) |y| {
         for (0..image.width) |x| {
-            if (start != null and start.?[0] == x) {
-                try ppm_writer.writeByte(0);
-                try ppm_writer.writeByte(0);
-                try ppm_writer.writeByte(255);
-            //}
-            //else if (scanner.isStartEndSequence(x, y)) |w| {
-            //    _ = w;
-            //    try ppm_writer.writeByte(255);
-            //    try ppm_writer.writeByte(255);
-            //    try ppm_writer.writeByte(0);
-            } else {
-                try ppm_writer.writeByte(processor.out.data[y * image.width + x]);
-                try ppm_writer.writeByte(processor.out.data[y * image.width + x]);
-                try ppm_writer.writeByte(processor.out.data[y * image.width + x]);
-            }
+            const to_write = switch (debug.data[y * image.width + x]) {
+                .none => blk: {
+                    const val: u8 = if (image.data[y * image.width + x] > 0) 255 else 0;
+                    break :blk .{val, val, val};
+                },
+                .potential_barcode_start => .{ 255, 255, 0 },
+                .barcode_start => .{ 0, 0, 255},
+            };
+            try ppm_writer.writeByte(to_write[0]);
+            try ppm_writer.writeByte(to_write[1]);
+            try ppm_writer.writeByte(to_write[2]);
         }
     }
+}
+
+fn writePpmu8(image: Image(u8)) !void {
+    var ppm = try std.fs.cwd().createFile("out2.ppm", .{});
+    defer ppm.close();
+
+    var ppm_writer = ppm.writer();
+    try ppm_writer.print(
+        \\P6
+        \\{d} {d}
+        \\255
+        \\
+    , .{image.width, image.calcHeight()});
+
+    for (0..image.calcHeight()) |y| {
+        for (0..image.width) |x| {
+            const val = image.data[y * image.width + x];
+            try ppm_writer.writeByte(val);
+            try ppm_writer.writeByte(val);
+            try ppm_writer.writeByte(val);
+        }
+    }
+}
+
+
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    const image = try loadImage("Untitled.png");
+    defer image.deinit();
+
+    const debug = try Image(DebugPurpose).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+    @memset(debug.data, .none);
+
+    const processor = try BarcodePreprocessor.init(arena.allocator(), image.inner);
+    try processor.process();
+
+    const scanner = BarcodeScanner {
+        .image = processor.out,
+        .debug = debug,
+    };
+
+    for (0..image.inner.calcHeight()) |y_us| {
+        const y: u31 = @intCast(y_us);
+        _ = scanner.findStart(y);
+        _ = scanner.parseLeft(y);
+    }
+
+    try writePpm(processor.out, debug);
 }
