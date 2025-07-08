@@ -194,6 +194,92 @@ const BarcodePreprocessor = struct {
     }
 };
 
+const BarcodeScanner2 = struct {
+    row: []const RleGenerator.RleItem,
+    debug: []DebugPurpose,
+
+    const length_variation_allowed: usize = 2;
+
+    // Returns RLE index
+    fn findStartSequence(self: BarcodeScanner2) ?usize {
+        if (self.row.len < 3) return null;
+        for (0..self.row.len - 3) |rle_idx| {
+            const start = self.findStartEndSequence(rle_idx) orelse continue;
+
+            // 4 transitions per character, 12 chars, + 5 in the middle sequence + 3 at the start
+            // - 1 for error tolerance
+            const potential_end_rle_idx = start.rle_idx + 4 * 12 + 5 + 3 - 1;
+
+            if (potential_end_rle_idx > self.row.len) continue;
+            for (potential_end_rle_idx..self.row.len) |search_idx| {
+                if (self.findStartEndSequence(search_idx)) |end| {
+                    // 7 modules per character, 12 chars, 5 modules  middle, 3 start, 3 end
+                    // end_rle_idx is start of the end segment, so drop last 3
+                    const expected_width_modules = 7 * 12 + 5 + 3;
+                    const width_px = countRleSizePx(self.row[start.rle_idx..end.rle_idx]);
+
+                    // Check if within some tolerance
+                    const expected_width_px = expected_width_modules * start.module_width;
+                    const err_px = diff(expected_width_px, width_px);
+                    const err_percent = err_px * 100 / expected_width_px;
+                    std.debug.print("err: {d} rle_width: {d}\n" ,.{err_percent, end.rle_idx - start.rle_idx});
+                    // FIXME: Check that end module width is ~= start module width
+                    // FIXME: Constrain search to that module width
+                    if (err_percent < 20) {
+                        const x_px: usize = countRleSizePx(self.row[0..start.rle_idx]);
+                        self.debug[x_px] = .barcode_start;
+                        self.debug[x_px + width_px] = .barcode_end;
+                        return rle_idx;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    const StartEndSeq = struct {
+        module_width: usize,
+        rle_idx: usize,
+    };
+
+    fn findStartEndSequence(self: BarcodeScanner2, start_idx: usize) ?StartEndSeq {
+        if (self.row.len < 3) return null;
+        if (self.row.len - 3 < start_idx) return null;
+        var x_px: usize = countRleSizePx(self.row[0..start_idx]);
+        for (start_idx..self.row.len - 3) |rle_idx| {
+            const a = self.row[rle_idx];
+
+            defer x_px += a.length;
+            const b = self.row[rle_idx + 1];
+            const c = self.row[rle_idx + 2];
+
+            if (b.val < a.val) continue;
+            if (c.val > b.val) continue;
+
+            if (diff(a.length, b.length) > length_variation_allowed) continue;
+            if (diff(b.length, c.length) > length_variation_allowed) continue;
+
+            self.debug[x_px] = .potential_barcode_start;
+            return .{
+                .module_width = a.length,
+                .rle_idx = rle_idx,
+            };
+        }
+
+        return null;
+    }
+
+    fn countRleSizePx(row_segment: []const RleGenerator.RleItem) usize {
+        var total: usize = 0;
+        for (row_segment) |elem| {
+            total += elem.length;
+        }
+        return total;
+    }
+
+};
+
 const BarcodeScanner = struct {
     image: Image(u1),
     debug: Image(DebugPurpose),
@@ -353,6 +439,7 @@ const DebugPurpose = enum {
     none,
     barcode_start,
     potential_barcode_start,
+    barcode_end,
 };
 
 fn writePpm(image: Image(u1), debug: Image(DebugPurpose)) !void {
@@ -379,6 +466,43 @@ fn writePpm(image: Image(u1), debug: Image(DebugPurpose)) !void {
                 },
                 .potential_barcode_start => .{ 255, 255, 0 },
                 .barcode_start => .{ 0, 0, 255},
+                .barcode_end => .{ 255, 0, 0},
+            };
+            try ppm_writer.writeByte(to_write[0]);
+            try ppm_writer.writeByte(to_write[1]);
+            try ppm_writer.writeByte(to_write[2]);
+        }
+    }
+}
+
+fn writeDebug(image: Image(u8), debug: Image(DebugPurpose)) !void {
+    std.debug.assert(image.width == debug.width);
+    std.debug.assert(image.data.len == debug.data.len);
+
+    var ppm = try std.fs.cwd().createFile("out.ppm", .{});
+    defer ppm.close();
+
+    var buf_writer = std.io.bufferedWriter(ppm.writer());
+    defer buf_writer.flush() catch {};
+    var ppm_writer = buf_writer.writer();
+
+    try ppm_writer.print(
+        \\P6
+        \\{d} {d}
+        \\255
+        \\
+    , .{image.width, image.calcHeight()});
+
+    for (0..image.calcHeight()) |y| {
+        for (0..image.width) |x| {
+            const to_write = switch (debug.data[y * image.width + x]) {
+                .none => blk: {
+                    const val: u8 = image.data[y * image.width + x];
+                    break :blk .{val, val, val};
+                },
+                .potential_barcode_start => .{ 255, 255, 0 },
+                .barcode_start => .{ 0, 0, 255},
+                .barcode_end => .{ 255, 0, 0},
             };
             try ppm_writer.writeByte(to_write[0]);
             try ppm_writer.writeByte(to_write[1]);
@@ -592,6 +716,57 @@ fn RollingAverage(comptime T: type, comptime size: comptime_int) type {
     };
 }
 
+fn diff(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    if (a > b) return a - b else return b - a;
+}
+
+const RleGenerator = struct {
+    row: std.ArrayList(RleItem),
+    min: u8 = std.math.maxInt(u8),
+    max: u8 = 0,
+    num_entries: usize = 0,
+
+    const EdgeDir = enum {
+        light_to_dark,
+        dark_to_light,
+    };
+
+    const RleItem = struct {
+        val: u8,
+        length: usize,
+    };
+
+    fn init(alloc: std.mem.Allocator) RleGenerator {
+        return .{
+            .row = .init(alloc),
+        };
+    }
+
+    fn pushPixel(self: *RleGenerator, val: u8) void {
+        self.min = @min(val, self.min);
+        self.max = @max(val, self.max);
+        self.num_entries += 1;
+    }
+
+    fn markEdge(self: *RleGenerator, edge_dir: EdgeDir) !void {
+        if (self.num_entries == 0) return;
+
+        const to_push = switch (edge_dir) {
+            .light_to_dark => self.max,
+            .dark_to_light => self.min,
+
+        };
+        try self.row.append(.{
+            .val = to_push,
+            .length = self.num_entries,
+        });
+
+        self.min = std.math.maxInt(u8);
+        self.max = 0;
+        self.num_entries = 0;
+    }
+};
+
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -635,17 +810,28 @@ pub fn main() !void {
     const edges = try Image(u32).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
     @memset(edges.data, 0);
 
-    var gradient_average = RollingAverage(u32, 2){};
-    const gradient_thresh = 60;
+    const rle_back_and_forth = try Image(u8).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+
+    const debug = try Image(DebugPurpose).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+    @memset(debug.data, .none);
+
+    var gradient_average = RollingAverage(u32, 1){};
+    const gradient_thresh = 5;
     std.debug.print("Calculating gradient\n", .{});
     for (0..edges.calcHeight()) |y| {
+        var row_rle = RleGenerator.init(arena.allocator());
         var last_average: u32 = 0;
         var increasing: bool = true;
+
         for (0..edges.width) |x| {
-            const this_gradient = @abs(blurry.applyKernelAtLoc(horizontal_gradient_kernel, @intCast(x), @intCast(y)).sum());
-            gradient_average.push(this_gradient);
+            row_rle.pushPixel(image.inner.data[y * image.inner.width + x]);
+            const this_gradient = blurry.applyKernelAtLoc(horizontal_gradient_kernel, @intCast(x), @intCast(y)).sum();
+            const gradient_dir: RleGenerator.EdgeDir = if (this_gradient < 0) .light_to_dark else .dark_to_light;
+
+            gradient_average.push(@abs(this_gradient));
             const averaged = gradient_average.average();
             if (averaged < last_average and increasing and last_average > gradient_thresh) {
+                try row_rle.markEdge(gradient_dir);
                 edges.data[y * edges.width + x - 1] = last_average;
             }
 
@@ -657,9 +843,33 @@ pub fn main() !void {
 
             last_average = averaged;
         }
+
+        // FIXME: Abusing info that outside should always be light
+        try row_rle.markEdge(.light_to_dark);
+
+        var x: usize = 0;
+        var length_sum: usize = 0;
+        for (row_rle.row.items) |item| {
+            length_sum += item.length;
+            for (0..item.length) |_| {
+                rle_back_and_forth.data[y * rle_back_and_forth.width + x] = item.val;
+                x += 1;
+            }
+        }
+
+        const row_start = y * debug.width;
+        const row_end = (y + 1) * debug.width;
+        var bcs = BarcodeScanner2 {
+            .debug = debug.data[row_start..row_end],
+            .row = row_rle.row.items,
+        };
+        _ = bcs.findStartSequence();
+        std.debug.assert(x == rle_back_and_forth.width);
     }
 
     try writeEdges(image.inner, edges, "edges.ppm");
+    try writePpmu8(rle_back_and_forth, "rle.ppm");
+    try writeDebug(rle_back_and_forth, debug);
 
     //std.debug.print("suppression\n", .{});
     //const suppressed = try Image(Gradient).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
@@ -734,24 +944,24 @@ pub fn main() !void {
     //try writePpmGrad(image.inner, gradient, "out2.ppm");
     //try writePpmGrad(image.inner, suppressed, "out3.ppm");
 
-    if (false) {
-        const debug = try Image(DebugPurpose).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
-        @memset(debug.data, .none);
+    //if (false) {
+    //    const debug = try Image(DebugPurpose).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+    //    @memset(debug.data, .none);
 
-        const processor = try BarcodePreprocessor.init(arena.allocator(), image.inner);
-        try processor.process();
+    //    const processor = try BarcodePreprocessor.init(arena.allocator(), image.inner);
+    //    try processor.process();
 
-        const scanner = BarcodeScanner {
-            .image = processor.out,
-            .debug = debug,
-        };
+    //    const scanner = BarcodeScanner {
+    //        .image = processor.out,
+    //        .debug = debug,
+    //    };
 
-        for (0..image.inner.calcHeight()) |y_us| {
-            const y: u31 = @intCast(y_us);
-            _ = scanner.findStart(y);
-            _ = scanner.parseLeft(y);
-        }
+    //    for (0..image.inner.calcHeight()) |y_us| {
+    //        const y: u31 = @intCast(y_us);
+    //        _ = scanner.findStart(y);
+    //        _ = scanner.parseLeft(y);
+    //    }
 
-        try writePpm(processor.out, debug);
-    }
+    //    try writePpm(processor.out, debug);
+    //}
 }
