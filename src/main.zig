@@ -33,6 +33,8 @@ fn loadImage(path: [:0]const u8) !StbiImage {
     };
 }
 
+// FIXME: only multiply + sum
+// FIXME: Needs non-square variants
 pub fn ImageKernel(comptime T: type, size: comptime_int) type {
     std.debug.assert(size % 2 == 1);
 
@@ -40,6 +42,8 @@ pub fn ImageKernel(comptime T: type, size: comptime_int) type {
         inner: [size * size]T,
 
         const Self = @This();
+
+        // Actually kinda like sum
         fn apply(self: Self, image: anytype, x: u31, y: u31) T {
             const image_height = image.calcHeight();
             var total: T = 0;
@@ -67,6 +71,24 @@ pub fn ImageKernel(comptime T: type, size: comptime_int) type {
     };
 }
 
+pub fn StackMat2D(comptime T: type, comptime height_: usize, comptime width_: usize) type {
+    return struct {
+        data: [width_ * height_]T,
+        const width = width_;
+        const height = height_;
+
+        const Self = @This();
+
+        fn sum(self: Self) T {
+            var ret: T = 0;
+            for (self.data) |v| {
+                ret += v;
+            }
+            return ret;
+        }
+    };
+}
+
 pub fn Image(comptime T: type) type {
     return struct {
         data: []T,
@@ -90,6 +112,42 @@ pub fn Image(comptime T: type) type {
                 .data = try alloc.dupe(u8, self.data),
                 .width = self.width,
             };
+        }
+
+        fn applyKernelAtLocSlice(self: Self, comptime KernelElem: type, kernel: []const KernelElem, x: u31, y: u31, kernel_width: u31, kernel_height: u31, out: []KernelElem) void {
+            std.debug.assert(kernel_width % 2 == 1);
+            std.debug.assert(kernel_height % 2 == 1);
+
+            const image_height = self.calcHeight();
+            const image_width = self.width;
+            for (0..kernel_height) |kernel_y| {
+                const image_y = kernelToImagePos(y, image_height, @intCast(kernel_y), kernel_height);
+                for (0..kernel_width) |kernel_x| {
+                    const image_x = kernelToImagePos(x, image_width, @intCast(kernel_x), kernel_width);
+
+                    const mul = kernel[kernel_y * kernel_width + kernel_x];
+                    const source = self.data[image_y * image_width + image_x];
+                    out[kernel_y * kernel_width + kernel_x] = mul * source;
+                }
+            }
+        }
+
+        fn kernelToImagePos(image_pos: u31, image_max: u31, kernel_pos: u31, kernel_max: u31) u31 {
+            const kernel_center = kernel_max / 2;
+            if (image_pos < kernel_center) return 0;
+            if (image_pos >= image_max - kernel_center) return image_max - 1;
+
+            return image_pos + kernel_pos - kernel_center;
+        }
+
+        fn applyKernelAtLoc(self: Self, kernel: anytype, x: u31, y: u31) @TypeOf(kernel) {
+            const kernel_data_ti = @typeInfo(@TypeOf(kernel.data));
+            const Kernel = @TypeOf(kernel);
+            const KernelElem = kernel_data_ti.array.child;
+
+            var ret: Kernel = undefined;
+            self.applyKernelAtLocSlice(KernelElem, &kernel.data, x, y, Kernel.width, Kernel.height, &ret.data);
+            return ret;
         }
     };
 }
@@ -328,11 +386,14 @@ fn writePpm(image: Image(u1), debug: Image(DebugPurpose)) !void {
     }
 }
 
-fn writePpmu8(image: Image(u8)) !void {
-    var ppm = try std.fs.cwd().createFile("out2.ppm", .{});
+fn writePpmu8(image: Image(u8), path: []const u8) !void {
+    var ppm = try std.fs.cwd().createFile(path, .{});
     defer ppm.close();
 
-    var ppm_writer = ppm.writer();
+    var buf_writer = std.io.bufferedWriter(ppm.writer());
+    defer buf_writer.flush() catch {};
+    var ppm_writer = buf_writer.writer();
+
     try ppm_writer.print(
         \\P6
         \\{d} {d}
@@ -350,30 +411,287 @@ fn writePpmu8(image: Image(u8)) !void {
     }
 }
 
+fn writePpmi16(image: Image(i16)) !void {
+    var ppm = try std.fs.cwd().createFile("out2.ppm", .{});
+    defer ppm.close();
+
+    var buf_writer = std.io.bufferedWriter(ppm.writer());
+    defer buf_writer.flush() catch {};
+    var ppm_writer = buf_writer.writer();
+    try ppm_writer.print(
+        \\P6
+        \\{d} {d}
+        \\255
+        \\
+    , .{image.width, image.calcHeight()});
+
+    for (0..image.calcHeight()) |y| {
+        for (0..image.width) |x| {
+            const val = image.data[y * image.width + x];
+            if (val < 0) {
+                try ppm_writer.writeByte(@intCast(std.math.clamp(@abs(val) >> 1, 0, 255)));
+                try ppm_writer.writeByte(0);
+                try ppm_writer.writeByte(0);
+            } else {
+                try ppm_writer.writeByte(0);
+                try ppm_writer.writeByte(0);
+                try ppm_writer.writeByte(@intCast(std.math.clamp(val >> 1, 0, 255)));
+            }
+        }
+    }
+}
+
+fn writePpmGrad(original: Image(u8), image: Image(Gradient), out_path: []const u8) !void {
+    var ppm = try std.fs.cwd().createFile(out_path, .{});
+    defer ppm.close();
+
+    var buf_writer = std.io.bufferedWriter(ppm.writer());
+    defer buf_writer.flush() catch {};
+    var ppm_writer = buf_writer.writer();
+    try ppm_writer.print(
+        \\P6
+        \\{d} {d}
+        \\255
+        \\
+    , .{image.width, image.calcHeight()});
+
+    for (0..image.calcHeight()) |y| {
+        for (0..image.width) |x| {
+            const val = image.data[y * image.width + x];
+            switch (val.confidence) {
+                .no, .maybe => {
+                    const original_val = original.data[original.width * y + x];
+                    try ppm_writer.writeByte(original_val);
+                    try ppm_writer.writeByte(original_val);
+                    try ppm_writer.writeByte(original_val);
+                    continue;
+                },
+                else => {},
+            }
+            const mag = val.magnitude;
+            const out = std.math.clamp(mag * 255.0 * 6, 0, 255);
+            const x_mul = @abs(@cos(val.direction));
+            const y_mul = @abs(@sin(val.direction));
+            if (out > 50) {
+                try ppm_writer.writeByte(@intFromFloat(x_mul * out));
+                try ppm_writer.writeByte(@intFromFloat(y_mul * out));
+                try ppm_writer.writeByte(0);
+
+            } else {
+                    const original_val = original.data[original.width * y + x];
+                    try ppm_writer.writeByte(original_val);
+                    try ppm_writer.writeByte(original_val);
+                    try ppm_writer.writeByte(original_val);
+            }
+        }
+    }
+}
+
+const Gradient = struct {
+    // radians[0, 2pi],
+    direction: f32,
+    magnitude: f32,
+    confidence: enum { no, maybe, yes } = .yes,
+};
+
+const lower_thresh = 0.05;
+const higher_thresh = 0.1;
+
+const SnappedGradDir = enum {
+    right,
+    up_right,
+    up,
+    up_left,
+
+    fn fromAngle(angle_in: f32) SnappedGradDir {
+        var angle = angle_in;
+        // map angle to [0,8], round, then % 4 to get direction
+        while (angle < 0) {
+            angle += std.math.pi * 2;
+        }
+
+        const to_round = angle / 2 / std.math.pi * 8;
+        std.debug.assert(angle >= 0);
+
+        const rounded: u8 = @intFromFloat(@round(to_round));
+        return @enumFromInt(rounded % 4);
+    }
+};
+
+test "Grid snap" {
+    try std.testing.expectEqual(.right, SnappedGradDir.fromAngle(0));
+    try std.testing.expectEqual(.right, SnappedGradDir.fromAngle(std.math.pi));
+
+    try std.testing.expectEqual(.up, SnappedGradDir.fromAngle(std.math.pi / 2.0));
+    try std.testing.expectEqual(.up, SnappedGradDir.fromAngle(3.0 * std.math.pi / 2.0));
+
+    try std.testing.expectEqual(.up_right, SnappedGradDir.fromAngle(std.math.pi / 4.0));
+    try std.testing.expectEqual(.up_right, SnappedGradDir.fromAngle(std.math.pi / 4.0 * 5.0));
+
+    try std.testing.expectEqual(.up_left, SnappedGradDir.fromAngle(std.math.pi / 4.0 * 3.0));
+    try std.testing.expectEqual(.up_left, SnappedGradDir.fromAngle(std.math.pi / 4.0 * 7.0));
+}
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
-    const image = try loadImage("Untitled.png");
+    const path = (try std.process.argsAlloc(arena.allocator()))[1];
+
+    const image = try loadImage(path);
     defer image.deinit();
 
-    const debug = try Image(DebugPurpose).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
-    @memset(debug.data, .none);
+    const gradient = try Image(Gradient).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
 
-    const processor = try BarcodePreprocessor.init(arena.allocator(), image.inner);
-    try processor.process();
-
-    const scanner = BarcodeScanner {
-        .image = processor.out,
-        .debug = debug,
+    const blur_kernel = StackMat2D(u16, 3, 5) {
+        .data = .{
+            4, 5, 4,
+            9, 12, 9,
+            12, 15, 12,
+            9, 12, 9,
+            4, 5, 4,
+        },
     };
 
-    for (0..image.inner.calcHeight()) |y_us| {
-        const y: u31 = @intCast(y_us);
-        _ = scanner.findStart(y);
-        _ = scanner.parseLeft(y);
+    std.debug.print("Applying blur\n", .{});
+    const blurry = try Image(u8).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+    for (0..blurry.calcHeight()) |y| {
+        for (0..blurry.width) |x| {
+            const blurred = image.inner.applyKernelAtLoc(blur_kernel, @intCast(x), @intCast(y)).sum() / blur_kernel.sum();
+            blurry.data[y * blurry.width + x] = @intCast(blurred);
+        }
     }
 
-    try writePpm(processor.out, debug);
+    try writePpmu8(blurry, "blurry.ppm");
+
+    const horizontal_gradient_kernel = ImageKernel(i32, 3) {
+        .inner = .{
+            -1, 0, 1,
+            -2, 0, 2,
+            -1, 0, 1,
+        },
+    };
+
+    const vertical_gradient_kernel = ImageKernel(i32, 3) {
+        .inner = .{
+             1,  2,  1,
+            0, 0, 0,
+            -1, -2, -1,
+        },
+    };
+
+    std.debug.print("Calculating gradient\n", .{});
+    for (0..gradient.calcHeight()) |y| {
+        for (0..gradient.width) |x| {
+            const x_gradient = horizontal_gradient_kernel.apply(blurry, @intCast(x), @intCast(y));
+            const y_gradient = vertical_gradient_kernel.apply(blurry, @intCast(x), @intCast(y));
+            const x_grad_f: f32 = @floatFromInt(x_gradient);
+            const y_grad_f: f32 = @floatFromInt(y_gradient);
+
+            var mag: f32 = @floatFromInt(x_gradient * x_gradient + y_gradient * y_gradient);
+            mag = std.math.sqrt(mag);
+            mag /= 1024.0;
+
+            const angle = std.math.atan2(y_grad_f, x_grad_f);
+
+            gradient.data[y * gradient.width + x] = .{
+                .magnitude = mag,
+                .direction = angle,
+            };
+        }
+    }
+
+    std.debug.print("suppression\n", .{});
+    const suppressed = try Image(Gradient).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+    for (0..suppressed.calcHeight()) |y| {
+        for (0..suppressed.width) |x| {
+            const in_grad = gradient.data[y * gradient.width + x];
+            const in_dir = SnappedGradDir.fromAngle(in_grad.direction);
+            var sample_coords: [2]struct {usize, usize } = switch (in_dir) {
+                .right => .{
+                    .{x -| 1, y},
+                    .{x + 1, y},
+                },
+                .up => .{
+                    .{x , y -| 1},
+                    .{x, y + 1},
+                },
+                .up_left => .{
+                    .{x -| 1 , y -| 1},
+                    .{x + 1, y + 1},
+                },
+                .up_right => .{
+                    .{x + 1 , y -| 1},
+                    .{x -| 1, y + 1},
+                },
+            };
+
+            suppressed.data[y * gradient.width + x] = in_grad;
+
+            for (&sample_coords) |*sample_coord| {
+                sample_coord[0] = @min(gradient.width - 1, sample_coord[0]);
+                sample_coord[1] = @min(gradient.calcHeight() - 1, sample_coord[1]);
+
+                const compare = gradient.data[sample_coord[1] * gradient.width + sample_coord[0]];
+                const compare_dir = SnappedGradDir.fromAngle(compare.direction);
+                if (compare_dir == in_dir and compare.magnitude > in_grad.magnitude) {
+                    suppressed.data[y * gradient.width + x].magnitude = 0;
+                    break;
+                }
+            }
+
+            if (in_grad.magnitude < lower_thresh) {
+                // FIXME: so much indexing
+                suppressed.data[y * gradient.width + x].confidence = .no;
+            } else if (in_grad.magnitude < higher_thresh) {
+                suppressed.data[y * gradient.width + x].confidence = .maybe;
+            } else {
+                suppressed.data[y * gradient.width + x].confidence = .yes;
+            }
+        }
+    }
+
+    for (0..suppressed.calcHeight()) |y| {
+        for (0..suppressed.width) |x| {
+            var y_it  = y -| 1;
+            while (y_it <= @min(y + 1, suppressed.calcHeight() - 1)) {
+                defer y_it += 1;
+
+                var x_it  = x -| 1;
+                while (x_it <= @min(x + 1, suppressed.width - 1)) {
+                    defer x_it += 1;
+
+                    if (suppressed.data[y_it * suppressed.width + x_it].confidence == .yes) {
+                        // FIXME: technically we are progressing more than 1 pixel
+                        suppressed.data[y * suppressed.width + x].confidence = .yes;
+                    }
+                }
+            }
+        }
+    }
+
+    std.debug.print("Writing to file\n", .{});
+    try writePpmGrad(image.inner, gradient, "out2.ppm");
+    try writePpmGrad(image.inner, suppressed, "out3.ppm");
+
+    if (false) {
+        const debug = try Image(DebugPurpose).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+        @memset(debug.data, .none);
+
+        const processor = try BarcodePreprocessor.init(arena.allocator(), image.inner);
+        try processor.process();
+
+        const scanner = BarcodeScanner {
+            .image = processor.out,
+            .debug = debug,
+        };
+
+        for (0..image.inner.calcHeight()) |y_us| {
+            const y: u31 = @intCast(y_us);
+            _ = scanner.findStart(y);
+            _ = scanner.parseLeft(y);
+        }
+
+        try writePpm(processor.out, debug);
+    }
 }
