@@ -222,10 +222,10 @@ const BarcodeScanner2 = struct {
                     const expected_width_px = expected_width_modules * start.module_width;
                     const err_px = diff(expected_width_px, width_px);
                     const err_percent = err_px * 100 / expected_width_px;
-                    std.debug.print("err: {d} rle_width: {d}\n" ,.{err_percent, end.rle_idx - start.rle_idx});
                     // FIXME: Check that end module width is ~= start module width
                     // FIXME: Constrain search to that module width
                     if (err_percent < 20) {
+                        std.debug.print("err: {d} rle_width: {d}\n" ,.{err_percent, end.rle_idx - start.rle_idx});
                         const x_px: usize = countRleSizePx(self.row[0..start.rle_idx]);
                         self.debug[x_px] = .barcode_start;
                         self.debug[x_px + width_px] = .barcode_end;
@@ -237,6 +237,37 @@ const BarcodeScanner2 = struct {
 
         return null;
     }
+
+
+    fn consumeDark(self: BarcodeScanner2, rle_idx: *usize) void {
+        if (rle_idx.* >= self.row.len) return;
+        const start_x = countRleSizePx(self.row[0..rle_idx.*]);
+        var last_val = self.row[rle_idx.*].val;
+        while (rle_idx.* < self.row.len and self.row[rle_idx.*].val <= last_val) {
+            last_val = self.row[rle_idx.*].val;
+            rle_idx.* += 1;
+        }
+        const end_x = countRleSizePx(self.row[0..rle_idx.*]);
+        for (self.debug[start_x..end_x]) |*di| {
+            di.* = .dark;
+        }
+    }
+
+    // FIXME: Heavily duplicated with consumeDark
+    fn consumeLight(self: BarcodeScanner2, rle_idx: *usize) void {
+        if (rle_idx.* >= self.row.len) return;
+        const start_x = countRleSizePx(self.row[0..rle_idx.*]);
+        var last_val = self.row[rle_idx.*].val;
+        while (rle_idx.* < self.row.len and self.row[rle_idx.*].val >= last_val) {
+            last_val = self.row[rle_idx.*].val;
+            rle_idx.* += 1;
+        }
+        const end_x = countRleSizePx(self.row[0..rle_idx.*]);
+        for (self.debug[start_x..end_x]) |*di| {
+            di.* = .light;
+        }
+    }
+
 
     const StartEndSeq = struct {
         module_width: usize,
@@ -440,6 +471,8 @@ const DebugPurpose = enum {
     barcode_start,
     potential_barcode_start,
     barcode_end,
+    dark,
+    light,
 };
 
 fn writePpm(image: Image(u1), debug: Image(DebugPurpose)) !void {
@@ -503,6 +536,8 @@ fn writeDebug(image: Image(u8), debug: Image(DebugPurpose)) !void {
                 .potential_barcode_start => .{ 255, 255, 0 },
                 .barcode_start => .{ 0, 0, 255},
                 .barcode_end => .{ 255, 0, 0},
+                .dark => .{ 0, 0, 0 },
+                .light => .{ 255, 255, 255},
             };
             try ppm_writer.writeByte(to_write[0]);
             try ppm_writer.writeByte(to_write[1]);
@@ -711,7 +746,7 @@ fn RollingAverage(comptime T: type, comptime size: comptime_int) type {
                 ret += v;
             }
 
-            return @intCast(ret / self.used);
+            return @divTrunc(ret, @as(T, @intCast(self.used)));
         }
     };
 }
@@ -810,38 +845,85 @@ pub fn main() !void {
     const edges = try Image(u32).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
     @memset(edges.data, 0);
 
+    // FIXME: Fold into edge data
+    const gradients = try Image(i32).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+    @memset(gradients.data, 0);
+
     const rle_back_and_forth = try Image(u8).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
 
     const debug = try Image(DebugPurpose).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
     @memset(debug.data, .none);
 
-    var gradient_average = RollingAverage(u32, 1){};
-    const gradient_thresh = 5;
+    var gradient_average = RollingAverage(i32, 1){};
+    const gradient_thresh = 20;
     std.debug.print("Calculating gradient\n", .{});
     for (0..edges.calcHeight()) |y| {
-        var row_rle = RleGenerator.init(arena.allocator());
-        var last_average: u32 = 0;
+        var last_average: i32 = 0;
         var increasing: bool = true;
 
         for (0..edges.width) |x| {
-            row_rle.pushPixel(image.inner.data[y * image.inner.width + x]);
             const this_gradient = blurry.applyKernelAtLoc(horizontal_gradient_kernel, @intCast(x), @intCast(y)).sum();
-            const gradient_dir: RleGenerator.EdgeDir = if (this_gradient < 0) .light_to_dark else .dark_to_light;
-
-            gradient_average.push(@abs(this_gradient));
-            const averaged = gradient_average.average();
-            if (averaged < last_average and increasing and last_average > gradient_thresh) {
-                try row_rle.markEdge(gradient_dir);
-                edges.data[y * edges.width + x - 1] = last_average;
+            gradient_average.push(this_gradient);
+            const saveraged = gradient_average.average();
+            const abs_averaged = @abs(saveraged);
+            const last_abs_average = @abs(last_average);
+            if (abs_averaged < last_abs_average and increasing and last_abs_average > gradient_thresh) {
+                edges.data[y * edges.width + x - 1] = @abs(last_average);
+                gradients.data[y * edges.width + x - 1] = last_average;
             }
 
-            if (averaged <= last_average) {
+            if (abs_averaged <= last_abs_average) {
                 increasing = false;
             } else {
                 increasing = true;
             }
 
-            last_average = averaged;
+            last_average = saveraged;
+        }
+    }
+    const edges2 = try Image(u32).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+    @memcpy(edges2.data, edges.data);
+
+
+    const horizontal_sibling_detect = StackMat2D(u32, 1, 3) {
+        .data = .{
+            1, 0, 1,
+        },
+    };
+
+    for (0..edges.calcHeight()) |y| {
+        var row_rle = RleGenerator.init(arena.allocator());
+
+        for (0..edges.width) |x| {
+            row_rle.pushPixel(image.inner.data[y * image.inner.width + x]);
+
+            if (edges.data[y * edges.width + x] > 0) {
+                const gradient = gradients.data[y * edges.width + x];
+                std.debug.assert(gradient != 0);
+                const edge_dir: RleGenerator.EdgeDir = if (gradient < 0) .light_to_dark else .dark_to_light;
+                try row_rle.markEdge(edge_dir);
+                continue;
+            }
+
+            const has_horiziontal_siblings = edges.applyKernelAtLoc(horizontal_sibling_detect, @intCast(x), @intCast(y)).sum() > 0;
+            if (has_horiziontal_siblings) continue;
+
+            for (y-|2..y+2) |sibling_y| {
+                if (sibling_y >= edges.calcHeight()) continue;
+                if (sibling_y == y) continue;
+
+                for (x-|1..x+1) |sibling_x| {
+                    if (sibling_x >= edges.width) continue;
+                    const other_idx = sibling_y * edges.width + x;
+                    if (edges.data[other_idx] > 0) {
+                        const gradient = gradients.data[other_idx];
+                        std.debug.assert(gradient != 0);
+                        edges2.data[y * edges.width + x] = edges.data[other_idx];
+                        const edge_dir: RleGenerator.EdgeDir = if (gradient < 0) .light_to_dark else .dark_to_light;
+                        try row_rle.markEdge(edge_dir);
+                    }
+                }
+            }
         }
 
         // FIXME: Abusing info that outside should always be light
@@ -863,11 +945,16 @@ pub fn main() !void {
             .debug = debug.data[row_start..row_end],
             .row = row_rle.row.items,
         };
-        _ = bcs.findStartSequence();
+        var scan_it = bcs.findStartSequence() orelse continue;
+        while (scan_it < bcs.row.len) {
+            bcs.consumeDark(&scan_it);
+            bcs.consumeLight(&scan_it);
+        }
         std.debug.assert(x == rle_back_and_forth.width);
     }
 
     try writeEdges(image.inner, edges, "edges.ppm");
+    try writeEdges(image.inner, edges2, "edges2.ppm");
     try writePpmu8(rle_back_and_forth, "rle.ppm");
     try writeDebug(rle_back_and_forth, debug);
 
