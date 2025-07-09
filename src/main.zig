@@ -27,7 +27,7 @@ fn loadImage(path: [:0]const u8) !StbiImage {
 
     return .{
         .inner = .{
-            .data = data[0..width * height],
+            .data = data[0 .. width * height],
             .width = width,
         },
     };
@@ -90,6 +90,92 @@ pub fn StackMat2D(comptime T: type, comptime height_: usize, comptime width_: us
     };
 }
 
+pub fn PixelIter(comptime T: type) type {
+    return struct {
+        // Actual positions in the image
+        x: u31,
+        y: u31,
+
+        // Logical positions according to iteration. e.g. iterate from [-2, 2].
+        // it_x: [-2, -1, 0, 1, 2 ]
+        // x:    [0, 0, 0, 1, 2]
+        it_x: i32,
+        it_y: i32,
+
+        start_x: i32,
+        start_y: i32,
+
+        end_x: i32,
+        end_y: i32,
+
+        image: Image(T),
+
+        const Self = @This();
+
+        fn init(image: Image(T), start_x: i32, end_x: i32, start_y: i32, end_y: i32) Self {
+            var ret = Self{
+                // updatePublic...() below
+                .x = undefined,
+                .y = undefined,
+                // NOTE: Expected that nextRow() and nextCol() are called
+                // at the start of a loop iterator style
+                .it_x = start_x - 1,
+                .it_y = start_y - 1,
+
+                .image = image,
+
+                .start_x = start_x,
+                .start_y = start_y,
+
+                .end_x = end_x,
+                .end_y = end_y,
+            };
+
+            ret.updateImageX();
+            ret.updateImageY();
+
+            return ret;
+        }
+
+        fn nextRow(self: *Self) bool {
+            if (self.it_y + 1 >= self.end_y) return false;
+
+            self.it_y += 1;
+            // NOTE: Expected that nextCol() is called
+            // at the start of a loop iterator style
+            self.it_x = self.start_x - 1;
+
+            self.updateImageX();
+            self.updateImageY();
+
+            return true;
+        }
+
+        fn nextCol(self: *Self) bool {
+            if (self.it_x + 1 >= self.end_x) return false;
+            if (self.it_y < self.start_y) {
+                if (self.nextRow() == false) return false;
+            }
+
+            self.it_x += 1;
+            self.updateImageX();
+            return true;
+        }
+
+        fn pixel(self: Self) *T {
+            return self.image.pixel(self.x, self.y);
+        }
+
+        fn updateImageX(self: *Self) void {
+            self.x = @intCast(std.math.clamp(self.it_x, 0, self.image.width - 1));
+        }
+
+        fn updateImageY(self: *Self) void {
+            self.y = @intCast(std.math.clamp(self.it_y, 0, self.image.calcHeight() - 1));
+        }
+    };
+}
+
 pub fn Image(comptime T: type) type {
     return struct {
         data: []T,
@@ -108,6 +194,41 @@ pub fn Image(comptime T: type) type {
             return @intCast(self.data.len / self.width);
         }
 
+        fn iter(self: Self) PixelIter(T) {
+            return PixelIter(T).init(
+                self,
+                0,
+                self.width,
+                0,
+                self.calcHeight(),
+            );
+        }
+
+        fn areaIt(self: Self, center_x: u31, center_y: u31, width: u31, height: u31) PixelIter(T) {
+            std.debug.assert(width % 2 == 1);
+            std.debug.assert(height % 2 == 1);
+
+            const half_width = width / 2;
+            const half_height = height / 2;
+
+            const start_x = @as(i32, center_x) - half_width;
+            const start_y = @as(i32, center_y) - half_height;
+            const end_x = center_x + half_width + 1;
+            const end_y = center_y + half_height + 1;
+
+            return PixelIter(T).init(
+                self,
+                start_x,
+                end_x,
+                start_y,
+                end_y,
+            );
+        }
+
+        fn pixel(self: Self, x: u31, y: u31) *T {
+            return &self.data[y * self.width + x];
+        }
+
         fn dupe(self: Image(u8), alloc: std.mem.Allocator) !Image(u8) {
             return .{
                 .data = try alloc.dupe(u8, self.data),
@@ -119,15 +240,13 @@ pub fn Image(comptime T: type) type {
             std.debug.assert(kernel_width % 2 == 1);
             std.debug.assert(kernel_height % 2 == 1);
 
-            const image_height = self.calcHeight();
-            const image_width = self.width;
-            for (0..kernel_height) |kernel_y| {
-                const image_y = kernelToImagePos(y, image_height, @intCast(kernel_y), kernel_height);
-                for (0..kernel_width) |kernel_x| {
-                    const image_x = kernelToImagePos(x, image_width, @intCast(kernel_x), kernel_width);
-
+            var it = self.areaIt(x, y, kernel_width, kernel_height);
+            while (it.nextRow()) {
+                const kernel_y: usize = @intCast(it.it_y - it.start_y);
+                while (it.nextCol()) {
+                    const kernel_x: usize = @intCast(it.it_x - it.start_x);
                     const mul = kernel[kernel_y * kernel_width + kernel_x];
-                    const source = self.data[image_y * image_width + image_x];
+                    const source = it.pixel().*;
                     out[kernel_y * kernel_width + kernel_x] = mul * source;
                 }
             }
@@ -148,6 +267,20 @@ pub fn Image(comptime T: type) type {
 
             var ret: Kernel = undefined;
             self.applyKernelAtLocSlice(KernelElem, &kernel.data, x, y, Kernel.width, Kernel.height, &ret.data);
+            return ret;
+        }
+
+        fn applyKernelToImage(self: Self, comptime OutT: type, alloc: std.mem.Allocator, kernel: anytype, post_op: anytype) !Image(OutT) {
+            var ret = try Image(OutT).init(alloc, self.width, self.calcHeight());
+
+            var it = self.iter();
+            while (it.nextRow()) {
+                while (it.nextCol()) {
+                    const out_vals = self.applyKernelAtLoc(kernel, it.x, it.y);
+                    ret.pixel(it.x, it.y).* = post_op.toPixel(out_vals);
+                }
+            }
+
             return ret;
         }
     };
@@ -225,7 +358,7 @@ const BarcodeScanner2 = struct {
                     // FIXME: Check that end module width is ~= start module width
                     // FIXME: Constrain search to that module width
                     if (err_percent < 20) {
-                        std.debug.print("err: {d} rle_width: {d}\n" ,.{err_percent, end.rle_idx - start.rle_idx});
+                        std.debug.print("err: {d} rle_width: {d}\n", .{ err_percent, end.rle_idx - start.rle_idx });
                         const x_px: usize = countRleSizePx(self.row[0..start.rle_idx]);
                         self.debug[x_px] = .barcode_start;
                         self.debug[x_px + width_px] = .barcode_end;
@@ -237,7 +370,6 @@ const BarcodeScanner2 = struct {
 
         return null;
     }
-
 
     fn consumeDark(self: BarcodeScanner2, rle_idx: *usize) void {
         if (rle_idx.* >= self.row.len) return;
@@ -267,7 +399,6 @@ const BarcodeScanner2 = struct {
             di.* = .light;
         }
     }
-
 
     const StartEndSeq = struct {
         module_width: usize,
@@ -308,7 +439,6 @@ const BarcodeScanner2 = struct {
         }
         return total;
     }
-
 };
 
 const BarcodeScanner = struct {
@@ -323,16 +453,16 @@ const BarcodeScanner = struct {
     //const ModulePattern = [7]u8;
     const ModulePattern = [4]u8;
     const numberLut = [_]ModulePattern{
-        .{3, 2, 1, 1},
-        .{2, 2, 2, 1},
-        .{2, 1, 2, 2},
-        .{1, 4, 1, 1},
-        .{1, 1, 3, 2},
-        .{1, 2, 3, 1},
-        .{1, 1, 1, 4},
-        .{1, 3, 1 ,2},
-        .{1, 2, 1, 3},
-        .{3, 1, 1, 2},
+        .{ 3, 2, 1, 1 },
+        .{ 2, 2, 2, 1 },
+        .{ 2, 1, 2, 2 },
+        .{ 1, 4, 1, 1 },
+        .{ 1, 1, 3, 2 },
+        .{ 1, 2, 3, 1 },
+        .{ 1, 1, 1, 4 },
+        .{ 1, 3, 1, 2 },
+        .{ 1, 2, 1, 3 },
+        .{ 3, 1, 1, 2 },
     };
 
     fn parseLeft(self: BarcodeScanner, y: u31) ?HalfUpcCode {
@@ -370,7 +500,6 @@ const BarcodeScanner = struct {
         const c = self.countLight(x, y);
         const d = self.countDark(x, y);
 
-
         var best_err: usize = std.math.maxInt(usize);
         var best_match: u8 = undefined;
         for (numberLut, 0..) |value, idx| {
@@ -393,7 +522,7 @@ const BarcodeScanner = struct {
         return null;
     }
 
-    fn findStart(self: BarcodeScanner, y: u31) ?struct{u31, u31} {
+    fn findStart(self: BarcodeScanner, y: u31) ?struct { u31, u31 } {
         for (0..self.image.width) |x_us| {
             const x: u31 = @intCast(x_us);
             const module_width = self.isStartEndSequence(x, y) orelse continue;
@@ -407,7 +536,7 @@ const BarcodeScanner = struct {
                 if (self.isStartEndSequence(end_test_x, y)) |_| {
                     const out_x = x + module_width * 4;
                     self.debug.data[y * self.debug.width + out_x] = .barcode_start;
-                    return .{out_x, module_width};
+                    return .{ out_x, module_width };
                 }
             }
         }
@@ -465,7 +594,6 @@ const BarcodeScanner = struct {
     }
 };
 
-
 const DebugPurpose = enum {
     none,
     barcode_start,
@@ -488,18 +616,18 @@ fn writePpm(image: Image(u1), debug: Image(DebugPurpose)) !void {
         \\{d} {d}
         \\255
         \\
-    , .{image.width, image.calcHeight()});
+    , .{ image.width, image.calcHeight() });
 
     for (0..image.calcHeight()) |y| {
         for (0..image.width) |x| {
             const to_write = switch (debug.data[y * image.width + x]) {
                 .none => blk: {
                     const val: u8 = if (image.data[y * image.width + x] > 0) 255 else 0;
-                    break :blk .{val, val, val};
+                    break :blk .{ val, val, val };
                 },
                 .potential_barcode_start => .{ 255, 255, 0 },
-                .barcode_start => .{ 0, 0, 255},
-                .barcode_end => .{ 255, 0, 0},
+                .barcode_start => .{ 0, 0, 255 },
+                .barcode_end => .{ 255, 0, 0 },
             };
             try ppm_writer.writeByte(to_write[0]);
             try ppm_writer.writeByte(to_write[1]);
@@ -524,20 +652,20 @@ fn writeDebug(image: Image(u8), debug: Image(DebugPurpose)) !void {
         \\{d} {d}
         \\255
         \\
-    , .{image.width, image.calcHeight()});
+    , .{ image.width, image.calcHeight() });
 
     for (0..image.calcHeight()) |y| {
         for (0..image.width) |x| {
             const to_write = switch (debug.data[y * image.width + x]) {
                 .none => blk: {
                     const val: u8 = image.data[y * image.width + x];
-                    break :blk .{val, val, val};
+                    break :blk .{ val, val, val };
                 },
                 .potential_barcode_start => .{ 255, 255, 0 },
-                .barcode_start => .{ 0, 0, 255},
-                .barcode_end => .{ 255, 0, 0},
+                .barcode_start => .{ 0, 0, 255 },
+                .barcode_end => .{ 255, 0, 0 },
                 .dark => .{ 0, 0, 0 },
-                .light => .{ 255, 255, 255},
+                .light => .{ 255, 255, 255 },
             };
             try ppm_writer.writeByte(to_write[0]);
             try ppm_writer.writeByte(to_write[1]);
@@ -559,7 +687,7 @@ fn writePpmu8(image: Image(u8), path: []const u8) !void {
         \\{d} {d}
         \\255
         \\
-    , .{image.width, image.calcHeight()});
+    , .{ image.width, image.calcHeight() });
 
     for (0..image.calcHeight()) |y| {
         for (0..image.width) |x| {
@@ -583,7 +711,7 @@ fn writePpmi16(image: Image(i16)) !void {
         \\{d} {d}
         \\255
         \\
-    , .{image.width, image.calcHeight()});
+    , .{ image.width, image.calcHeight() });
 
     for (0..image.calcHeight()) |y| {
         for (0..image.width) |x| {
@@ -613,7 +741,7 @@ fn writePpmGrad(original: Image(u8), image: Image(Gradient), out_path: []const u
         \\{d} {d}
         \\255
         \\
-    , .{image.width, image.calcHeight()});
+    , .{ image.width, image.calcHeight() });
 
     for (0..image.calcHeight()) |y| {
         for (0..image.width) |x| {
@@ -636,12 +764,11 @@ fn writePpmGrad(original: Image(u8), image: Image(Gradient), out_path: []const u
                 try ppm_writer.writeByte(@intFromFloat(x_mul * out));
                 try ppm_writer.writeByte(@intFromFloat(y_mul * out));
                 try ppm_writer.writeByte(0);
-
             } else {
-                    const original_val = original.data[original.width * y + x];
-                    try ppm_writer.writeByte(original_val);
-                    try ppm_writer.writeByte(original_val);
-                    try ppm_writer.writeByte(original_val);
+                const original_val = original.data[original.width * y + x];
+                try ppm_writer.writeByte(original_val);
+                try ppm_writer.writeByte(original_val);
+                try ppm_writer.writeByte(original_val);
             }
         }
     }
@@ -659,7 +786,7 @@ fn writeEdges(original: Image(u8), edges: Image(u32), out_path: []const u8) !voi
         \\{d} {d}
         \\255
         \\
-    , .{edges.width, edges.calcHeight()});
+    , .{ edges.width, edges.calcHeight() });
 
     for (0..edges.calcHeight()) |y| {
         for (0..edges.width) |x| {
@@ -669,9 +796,39 @@ fn writeEdges(original: Image(u8), edges: Image(u32), out_path: []const u8) !voi
                 try ppm_writer.writeByte(source_val);
                 try ppm_writer.writeByte(source_val);
                 try ppm_writer.writeByte(source_val);
-
             } else {
                 try ppm_writer.writeByte(@intCast(@min(val, 255)));
+                try ppm_writer.writeByte(0);
+                try ppm_writer.writeByte(0);
+            }
+        }
+    }
+}
+
+fn writeEdgePass1(original: Image(u8), edges: Image(i32), out_path: []const u8) !void {
+    var ppm = try std.fs.cwd().createFile(out_path, .{});
+    defer ppm.close();
+
+    var buf_writer = std.io.bufferedWriter(ppm.writer());
+    defer buf_writer.flush() catch {};
+    var ppm_writer = buf_writer.writer();
+    try ppm_writer.print(
+        \\P6
+        \\{d} {d}
+        \\255
+        \\
+    , .{ edges.width, edges.calcHeight() });
+
+    for (0..edges.calcHeight()) |y| {
+        for (0..edges.width) |x| {
+            const val = edges.data[y * edges.width + x];
+            if (val == 0) {
+                const source_val = original.data[y * original.width + x];
+                try ppm_writer.writeByte(source_val);
+                try ppm_writer.writeByte(source_val);
+                try ppm_writer.writeByte(source_val);
+            } else {
+                try ppm_writer.writeByte(@intCast(@min(@abs(val), 255)));
                 try ppm_writer.writeByte(0);
                 try ppm_writer.writeByte(0);
             }
@@ -789,7 +946,6 @@ const RleGenerator = struct {
         const to_push = switch (edge_dir) {
             .light_to_dark => self.max,
             .dark_to_light => self.min,
-
         };
         try self.row.append(.{
             .val = to_push,
@@ -802,39 +958,12 @@ const RleGenerator = struct {
     }
 };
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
+fn edgePass1(alloc: std.mem.Allocator, blurry: Image(u8)) !Image(i32) {
+    // Find edges
+    const edges = try Image(i32).init(alloc, blurry.width, blurry.calcHeight());
+    @memset(edges.data, 0);
 
-    const path = (try std.process.argsAlloc(arena.allocator()))[1];
-
-    const image = try loadImage(path);
-    defer image.deinit();
-
-    //const gradient = try Image(Gradient).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
-
-    const blur_kernel = StackMat2D(u16, 1, 5) {
-        .data = .{
-            5,
-            12,
-            15,
-            12,
-            5,
-        },
-    };
-
-    std.debug.print("Applying blur\n", .{});
-    const blurry = try Image(u8).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
-    for (0..blurry.calcHeight()) |y| {
-        for (0..blurry.width) |x| {
-            const blurred = image.inner.applyKernelAtLoc(blur_kernel, @intCast(x), @intCast(y)).sum() / blur_kernel.sum();
-            blurry.data[y * blurry.width + x] = @intCast(blurred);
-        }
-    }
-
-    //try writePpmu8(blurry, "blurry.ppm");
-
-    const horizontal_gradient_kernel = StackMat2D(i32, 3, 3) {
+    const horizontal_gradient_kernel = StackMat2D(i32, 3, 3){
         .data = .{
             -1, 0, 1,
             -2, 0, 2,
@@ -842,34 +971,26 @@ pub fn main() !void {
         },
     };
 
-    const edges = try Image(u32).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
-    @memset(edges.data, 0);
 
-    // FIXME: Fold into edge data
-    const gradients = try Image(i32).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
-    @memset(gradients.data, 0);
-
-    const rle_back_and_forth = try Image(u8).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
-
-    const debug = try Image(DebugPurpose).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
-    @memset(debug.data, .none);
+    var edges_it = edges.iter();
+    std.debug.print("Calculating gradient\n", .{});
 
     var gradient_average = RollingAverage(i32, 1){};
     const gradient_thresh = 20;
-    std.debug.print("Calculating gradient\n", .{});
-    for (0..edges.calcHeight()) |y| {
+
+    while (edges_it.nextRow()) {
         var last_average: i32 = 0;
         var increasing: bool = true;
 
-        for (0..edges.width) |x| {
-            const this_gradient = blurry.applyKernelAtLoc(horizontal_gradient_kernel, @intCast(x), @intCast(y)).sum();
+        while (edges_it.nextCol()) {
+            const this_gradient = blurry.applyKernelAtLoc(horizontal_gradient_kernel, edges_it.x, edges_it.y).sum();
             gradient_average.push(this_gradient);
             const saveraged = gradient_average.average();
             const abs_averaged = @abs(saveraged);
             const last_abs_average = @abs(last_average);
+
             if (abs_averaged < last_abs_average and increasing and last_abs_average > gradient_thresh) {
-                edges.data[y * edges.width + x - 1] = @abs(last_average);
-                gradients.data[y * edges.width + x - 1] = last_average;
+                edges_it.pixel().* = last_average;
             }
 
             if (abs_averaged <= last_abs_average) {
@@ -881,48 +1002,112 @@ pub fn main() !void {
             last_average = saveraged;
         }
     }
-    const edges2 = try Image(u32).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
-    @memcpy(edges2.data, edges.data);
+    return edges;
+}
 
+fn hasHorizontalSibling(edges: Image(i32), x: u31, y: u31) bool{
+    var it = edges.areaIt(x, y, 5, 1);
+    while (it.nextCol()) {
+        if (edges.pixel(it.x, it.y).* != 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
-    const horizontal_sibling_detect = StackMat2D(u32, 1, 3) {
+fn getNearbyGradient(edges: Image(i32), x: u31, y: u31) ?i32 {
+    // Looking for 2 rows up and down for pixel directly to the or right to
+    // merge with above/below edges
+    var it = edges.areaIt(x, y, 1, 5);
+    while (it.nextRow()) {
+        if (it.y == y) continue;
+
+        while (it.nextCol()) {
+            const gradient = it.pixel().*;
+            if (gradient != 0) {
+                // FIXME: Shouldn't just pick the first one
+                return gradient;
+            }
+        }
+    }
+
+    return null;
+}
+
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    const path = (try std.process.argsAlloc(arena.allocator()))[1];
+
+    const image = try loadImage(path);
+    defer image.deinit();
+
+    //const gradient = try Image(Gradient).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+
+    const blur_kernel = StackMat2D(u16, 1, 5){
         .data = .{
-            1, 0, 1,
+            5,
+            12,
+            15,
+            12,
+            5,
         },
     };
 
-    for (0..edges.calcHeight()) |y| {
+    std.debug.print("Applying blur\n", .{});
+    const BlurPostOp = struct {
+        divisor: u16,
+
+        pub fn toPixel(self: @This(), in: @TypeOf(blur_kernel)) u8 {
+            return @intCast(in.sum() / self.divisor);
+        }
+    };
+
+    const blurry = try image.inner.applyKernelToImage(
+        u8,
+        arena.allocator(),
+        blur_kernel,
+        BlurPostOp{ .divisor = blur_kernel.sum() },
+    );
+
+    try writePpmu8(blurry, "blurry.ppm");
+
+    // FIXME: Fold into edge data
+    const gradients = try Image(i32).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+    @memset(gradients.data, 0);
+
+    // Output debug image from edges / RLE info
+    const rle_back_and_forth = try Image(u8).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+
+    const debug = try Image(DebugPurpose).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+    @memset(debug.data, .none);
+
+    const edges = try edgePass1(arena.allocator(), blurry);
+    const edges2 = try Image(u32).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+    @memset(edges2.data, 0);
+
+    var it = edges2.iter();
+    while (it.nextRow()) {
         var row_rle = RleGenerator.init(arena.allocator());
 
-        for (0..edges.width) |x| {
-            row_rle.pushPixel(image.inner.data[y * image.inner.width + x]);
+        while (it.nextCol()) {
+            row_rle.pushPixel(image.inner.pixel(it.x, it.y).*);
 
-            if (edges.data[y * edges.width + x] > 0) {
-                const gradient = gradients.data[y * edges.width + x];
-                std.debug.assert(gradient != 0);
+            const gradient = edges.pixel(it.x, it.y).*;
+            if (gradient != 0) {
+                it.pixel().* = @abs(gradient);
                 const edge_dir: RleGenerator.EdgeDir = if (gradient < 0) .light_to_dark else .dark_to_light;
                 try row_rle.markEdge(edge_dir);
                 continue;
             }
 
-            const has_horiziontal_siblings = edges.applyKernelAtLoc(horizontal_sibling_detect, @intCast(x), @intCast(y)).sum() > 0;
-            if (has_horiziontal_siblings) continue;
+            if (hasHorizontalSibling(edges, it.x, it.y)) continue;
 
-            for (y-|2..y+2) |sibling_y| {
-                if (sibling_y >= edges.calcHeight()) continue;
-                if (sibling_y == y) continue;
-
-                for (x-|1..x+1) |sibling_x| {
-                    if (sibling_x >= edges.width) continue;
-                    const other_idx = sibling_y * edges.width + x;
-                    if (edges.data[other_idx] > 0) {
-                        const gradient = gradients.data[other_idx];
-                        std.debug.assert(gradient != 0);
-                        edges2.data[y * edges.width + x] = edges.data[other_idx];
-                        const edge_dir: RleGenerator.EdgeDir = if (gradient < 0) .light_to_dark else .dark_to_light;
-                        try row_rle.markEdge(edge_dir);
-                    }
-                }
+            if (getNearbyGradient(edges, it.x, it.y)) |nearby_gradient| {
+                it.pixel().* = @abs(nearby_gradient);
+                const edge_dir: RleGenerator.EdgeDir = if (nearby_gradient < 0) .light_to_dark else .dark_to_light;
+                try row_rle.markEdge(edge_dir);
             }
         }
 
@@ -934,14 +1119,14 @@ pub fn main() !void {
         for (row_rle.row.items) |item| {
             length_sum += item.length;
             for (0..item.length) |_| {
-                rle_back_and_forth.data[y * rle_back_and_forth.width + x] = item.val;
+                rle_back_and_forth.data[it.y * rle_back_and_forth.width + x] = item.val;
                 x += 1;
             }
         }
 
-        const row_start = y * debug.width;
-        const row_end = (y + 1) * debug.width;
-        var bcs = BarcodeScanner2 {
+        const row_start = it.y * debug.width;
+        const row_end = (it.y + 1) * debug.width;
+        var bcs = BarcodeScanner2{
             .debug = debug.data[row_start..row_end],
             .row = row_rle.row.items,
         };
@@ -953,7 +1138,7 @@ pub fn main() !void {
         std.debug.assert(x == rle_back_and_forth.width);
     }
 
-    try writeEdges(image.inner, edges, "edges.ppm");
+    try writeEdgePass1(image.inner, edges, "edges.ppm");
     try writeEdges(image.inner, edges2, "edges2.ppm");
     try writePpmu8(rle_back_and_forth, "rle.ppm");
     try writeDebug(rle_back_and_forth, debug);
