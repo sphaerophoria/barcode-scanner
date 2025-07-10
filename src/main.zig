@@ -2,6 +2,7 @@ const std = @import("std");
 const stbi = @cImport({
     @cInclude("stb_image.h");
 });
+const sphtud = @import("sphtud");
 
 const StbiImage = struct {
     inner: Image(u8),
@@ -149,6 +150,12 @@ pub fn PixelIter(comptime T: type) type {
             self.updateImageY();
 
             return true;
+        }
+
+        fn nextPixel(self: *Self) bool {
+            if (self.nextCol()) return true;
+            if (self.nextRow()) return true;
+            return false;
         }
 
         fn nextCol(self: *Self) bool {
@@ -819,6 +826,40 @@ fn writePpmGrad(original: Image(u8), image: Image(Gradient), out_path: []const u
     }
 }
 
+fn gradientToTexture(gl_alloc: *sphtud.render.GlAlloc, scratch: *sphtud.alloc.ScratchAlloc, original: Image(u8), image: Image(Gradient)) !sphtud.render.Texture {
+    const checkpoint = scratch.checkpoint();
+    defer scratch.restore(checkpoint);
+
+    std.debug.assert(image.width == original.width);
+    std.debug.assert(image.calcHeight() == original.calcHeight());
+
+    const out = try Image(GlPixel).init(scratch.allocator(), image.width, image.calcHeight());
+    var it = image.iter();
+    while (it.nextPixel()) {
+        const val = it.pixel().*;
+        const pixel: GlPixel = switch (val.confidence) {
+            .no, .maybe => blk: {
+                const original_val = original.pixel(it.x, it.y).*;
+                break :blk .{ .r = original_val, .g = original_val, .b = original_val, .a = 255 };
+            },
+            else => blk: {
+                const mag = val.magnitude;
+                const color = hsvToRgb(val.direction, 1, 1);
+                break :blk .{
+                    .r = @intFromFloat(color.r * mag),
+                    .g = @intFromFloat(color.g * mag),
+                    .b = @intFromFloat(color.b * mag),
+                    .a = 255,
+                };
+            },
+        };
+
+        out.pixel(it.x, it.y).* = pixel;
+    }
+
+    return try sphtud.render.makeTextureFromRgba(gl_alloc, @ptrCast(out.data), image.width);
+}
+
 fn writeClusters(clusters: Clusters, image: Image(Gradient), out_path: []const u8) !void {
     var ppm = try std.fs.cwd().createFile(out_path, .{});
     defer ppm.close();
@@ -864,6 +905,45 @@ fn writeClusters(clusters: Clusters, image: Image(Gradient), out_path: []const u
             try ppm_writer.writeByte(@intFromFloat(color.b ));
         }
     }
+}
+
+fn clustersToTex(gl_alloc: *sphtud.render.GlAlloc, scratch: *sphtud.alloc.ScratchAlloc, clusters: Clusters, gradient: Image(Gradient)) !sphtud.render.Texture {
+    const checkpoint = scratch.checkpoint();
+    defer scratch.restore(checkpoint);
+
+    std.debug.assert(gradient.width == clusters.image.width);
+    std.debug.assert(gradient.calcHeight() == clusters.image.calcHeight());
+
+    const out = try Image(GlPixel).init(scratch.allocator(), gradient.width, gradient.calcHeight());
+    @memset(out.data, .{.r = 0, .g = 0, .b = 0, .a = 255});
+
+    var it = gradient.iter();
+    while (it.nextRow()) {
+        while (it.nextCol()) {
+            const val = it.pixel().*;
+            const mag = val.magnitude;
+
+            const cluster_id = clusters.image.pixel(it.x, it.y).*;
+
+            if (cluster_id == 0) {
+                continue;
+            }
+
+            var cluster_angle: f32 = @floatFromInt((cluster_id * 1) % clusters.num_clusters);
+            cluster_angle *= std.math.pi;
+            cluster_angle /= @floatFromInt(clusters.num_clusters);
+
+            const color = hsvToRgb(cluster_angle, 1, 1);
+            out.pixel(it.x, it.y).* = .{
+                .r = @intFromFloat(color.r * mag),
+                .g = @intFromFloat(color.g * mag),
+                .b = @intFromFloat(color.b * mag),
+                .a = 255,
+            };
+        }
+    }
+
+    return sphtud.render.makeTextureFromRgba(gl_alloc, @ptrCast(out.data), out.width);
 }
 
 fn writeEdges(original: Image(u8), edges: Image(u32), out_path: []const u8) !void {
@@ -1326,7 +1406,187 @@ fn clusterImageGradient(alloc: std.mem.Allocator, input: Image(Gradient)) !Clust
     };
 }
 
+const GuiAction = enum {
+    asdf,
+
+};
+
+const ImageTexture = struct {
+    tex: sphtud.render.Texture,
+    width: u31,
+    height: u31,
+
+
+    fn init(gl_alloc: *sphtud.render.GlAlloc, image: Image(u8)) !ImageTexture {
+        const tex = try sphtud.render.makeTextureFromR(gl_alloc, image.data, image.width);
+        return .{
+            .tex = tex,
+            .width = image.width,
+            .height = image.calcHeight(),
+        };
+    }
+
+    pub fn getTexture(self: ImageTexture) sphtud.render.Texture {
+        return self.tex;
+    }
+
+    pub fn getSize(self: ImageTexture) sphtud.ui.PixelSize {
+        return .{
+            .width = self.width, .height = self.height,
+        };
+
+    }
+};
+
+const ImageView = struct {
+    image_renderer: *const sphtud.render.xyuvt_program.ImageRenderer,
+    tex: sphtud.render.Texture,
+    width: u31,
+    aspect: f32,
+
+    fn init(
+        gui_alloc: sphtud.ui.GuiAlloc,
+        image_renderer: *const sphtud.render.xyuvt_program.ImageRenderer,
+        image: Image(u8),
+    ) !sphtud.ui.Widget(GuiAction) {
+        const tex = try sphtud.render.makeTextureFromR(gui_alloc.gl, image.data, image.width);
+        const ret = try gui_alloc.heap.arena().create(ImageView);
+        const aspect = @as(f32, @floatFromInt(image.width)) / @as(f32, @floatFromInt(image.calcHeight()));
+        ret.* = .{
+            .image_renderer = image_renderer,
+            .tex = tex,
+            .width = image.width,
+            .aspect = aspect,
+        };
+        return ret.asWidget();
+    }
+
+    fn initTex(
+        gui_alloc: sphtud.ui.GuiAlloc,
+        image_renderer: *const sphtud.render.xyuvt_program.ImageRenderer,
+        tex: sphtud.render.Texture,
+        width: u31,
+        height: u31,
+    ) !sphtud.ui.Widget(GuiAction) {
+        const ret = try gui_alloc.heap.arena().create(ImageView);
+        const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
+        ret.* = .{
+            .image_renderer = image_renderer,
+            .tex = tex,
+            .width = width,
+            .aspect = aspect,
+        };
+        return ret.asWidget();
+    }
+
+
+    const vtable = sphtud.ui.Widget(GuiAction).VTable {
+        .render = render,
+        .getSize = getSize,
+        .update = update,
+        .setInputState = null,
+        .setFocused = null,
+        .reset = null,
+    };
+
+    fn asWidget(self: *ImageView) sphtud.ui.Widget(GuiAction) {
+        return .{
+            .vtable = &vtable,
+            .name = "image_view",
+            .ctx = self,
+        };
+    }
+
+    fn render(ctx: ?*anyopaque, widget_bounds: sphtud.ui.PixelBBox, window_bounds: sphtud.ui.PixelBBox) void {
+        const self: *ImageView = @ptrCast(@alignCast(ctx));
+        const transform = sphtud.ui.util.widgetToClipTransform(widget_bounds, window_bounds);
+        self.image_renderer.renderTexture(self.tex, transform);
+    }
+
+    fn getSize(ctx: ?*anyopaque) sphtud.ui.PixelSize {
+        const self: *ImageView = @ptrCast(@alignCast(ctx));
+        return .{
+            .width = self.width,
+            .height = @intFromFloat(@as(f32, @floatFromInt(self.width)) / self.aspect),
+        };
+    }
+
+    fn update(ctx: ?*anyopaque, available_size: sphtud.ui.PixelSize, _: f32) anyerror!void {
+        const self: *ImageView = @ptrCast(@alignCast(ctx));
+
+        self.width = available_size.width;
+    }
+};
+
+const GlPixel = packed struct (u32) {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+};
+
+fn debugToTexture(out_alloc: *sphtud.render.GlAlloc, scratch: *sphtud.alloc.ScratchAlloc, image: Image(u8), debug: Image(DebugPurpose)) !sphtud.render.Texture {
+    const checkpoint = scratch.checkpoint();
+    defer scratch.restore(checkpoint);
+
+    std.debug.assert(image.width == debug.width);
+    std.debug.assert(image.calcHeight() == debug.calcHeight());
+
+    const out = try Image(GlPixel).init(scratch.allocator(), image.width, image.calcHeight());
+
+    var it = debug.iter();
+    while (it.nextPixel()) {
+        const pixel: GlPixel = switch (debug.pixel(it.x, it.y).*) {
+            .none => blk: {
+                const val: u8 = image.pixel(it.x, it.y).*;
+                break :blk .{ .r = val, .g = val, .b = val, .a = 255 };
+            },
+            .potential_barcode_start => .{ .r = 255, .g = 255, .b = 0, .a = 255 },
+            .barcode_start => .{ .r = 0, .g = 0, .b = 255, .a = 255 },
+            .barcode_end => .{ .r = 255, .g = 0, .b = 0, .a = 255 },
+            .dark => .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+            .light => .{ .r = 255, .g = 255, .b = 255, .a = 255 },
+        };
+        out.pixel(it.x, it.y).* = pixel;
+    }
+
+    return try sphtud.render.makeTextureFromRgba(out_alloc, @ptrCast(out.data), image.width);
+}
+
 pub fn main() !void {
+    var window: sphtud.window.Window = undefined;
+    try window.initPinned("barcode-scanner", 800, 600);
+
+    var tpa = sphtud.alloc.TinyPageAllocator(100){};
+    var root_alloc: sphtud.alloc.Sphalloc = undefined;
+    try root_alloc.initPinned(tpa.allocator(), "root");
+
+
+    var scratch = sphtud.alloc.ScratchAlloc.init(try root_alloc.arena().alloc(u8, 10 * 1024 * 1024));
+
+    const gl_heap = try root_alloc.makeSubAlloc("gl");
+    var render_alloc = try sphtud.render.GlAlloc.init(gl_heap);
+    var gl_scratch = try sphtud.render.GlAlloc.init(gl_heap);
+    const gui_alloc = sphtud.ui.GuiAlloc {
+        .heap = try root_alloc.makeSubAlloc("gui"),
+        .gl = &render_alloc,
+    };
+
+    sphtud.render.gl.glEnable(sphtud.render.gl.GL_MULTISAMPLE);
+    sphtud.render.gl.glEnable(sphtud.render.gl.GL_SCISSOR_TEST);
+    sphtud.render.gl.glBlendFunc(sphtud.render.gl.GL_SRC_ALPHA, sphtud.render.gl.GL_ONE_MINUS_SRC_ALPHA);
+    sphtud.render.gl.glEnable(sphtud.render.gl.GL_BLEND);
+
+
+    var gui_state = try sphtud.ui.widget_factory.widgetState(GuiAction, gui_alloc, &scratch, &gl_scratch);
+
+    const widget_factory = gui_state.factory(gui_alloc);
+    const root_layout = try widget_factory.makeLayout();
+    const root_widget = try widget_factory.makeScrollView(root_layout.asWidget());
+
+    try root_layout.pushWidget(try widget_factory.makeLabel("Hello world"));
+    var runner = try widget_factory.makeRunner(root_widget);
+
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
@@ -1435,6 +1695,41 @@ pub fn main() !void {
         }
         std.debug.assert(x == rle_back_and_forth.width);
     }
+
+    const grey_image_renderer = try sphtud.render.xyuvt_program.ImageRenderer.init(gui_alloc.gl, .greyscale);
+    try root_layout.pushWidget(try ImageView.init(gui_alloc, &grey_image_renderer, image.inner));
+
+    try root_layout.pushWidget(try ImageView.init(gui_alloc, &grey_image_renderer, blurry));
+
+    const debug_tex = try debugToTexture(&render_alloc, &scratch, image.inner, debug);
+    try root_layout.pushWidget(try ImageView.initTex(gui_alloc, &gui_state.image_renderer, debug_tex, debug.width, debug.calcHeight()));
+
+    const sobel_tex = try gradientToTexture(&render_alloc, &scratch, image.inner, sobel_out);
+    try root_layout.pushWidget(try ImageView.initTex(gui_alloc, &gui_state.image_renderer, sobel_tex, sobel_out.width, sobel_out.calcHeight()));
+
+    const clusters_tex = try clustersToTex(&render_alloc, &scratch, clusters, sobel_out);
+    try root_layout.pushWidget(try ImageView.initTex(gui_alloc, &gui_state.image_renderer, clusters_tex, clusters.image.width, clusters.image.calcHeight()));
+
+    while (!window.closed()) {
+        scratch.reset();
+        gl_scratch.reset();
+
+        const window_width, const window_height = window.getWindowSize();
+
+        sphtud.render.gl.glClear(sphtud.render.gl.GL_COLOR_BUFFER_BIT);
+
+        sphtud.render.gl.glViewport(0, 0, @intCast(window_width), @intCast(window_height));
+        sphtud.render.gl.glScissor(0, 0, @intCast(window_width), @intCast(window_height));
+
+        std.debug.print("{d}x{d}\n", .{window_width, window_height});
+        const action = try runner.step(1.0, .{
+            .width = @intCast(window_width),
+            .height = @intCast(window_height),
+        }, &window.queue);
+        std.debug.print("{any}\n", .{action});
+        window.swapBuffers();
+    }
+
 
     try writeEdgePass1(image.inner, edges, "edges.ppm");
     try writeEdges(image.inner, edges2, "edges2.ppm");
