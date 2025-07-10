@@ -729,6 +729,60 @@ fn writePpmi16(image: Image(i16)) !void {
     }
 }
 
+const Rgb = struct {
+    r: f32,
+    g: f32,
+    b: f32,
+};
+
+fn hsvToRgb(h: f32, s: f32, v: f32) Rgb {
+    var r_temp: f32 =  undefined;
+    var g_temp: f32 =  undefined;
+    var b_temp: f32 =  undefined;
+    std.debug.assert(h >= 0 and h < std.math.pi);
+
+    if (s == 0) {
+        r_temp = v;
+        g_temp = v;
+        b_temp = v;
+    } else {
+        const sector = h / std.math.pi * 3; // sector 0 to 5
+        const i: i32 = @intFromFloat(sector); // integer part of sector
+        const f = sector - @as(f32, @floatFromInt(i)); // fractional part of sector
+        const p = v * (1 - s);
+        const q = v * (1 - f * s);
+        const t = v * (1 - (1 - f) * s);
+
+        switch (i) {
+            0=> {
+                r_temp = v; g_temp = t; b_temp = p;
+            },
+            1 => {
+                r_temp = q; g_temp = v; b_temp = p;
+            },
+            2 => {
+                r_temp = p; g_temp = v; b_temp = t;
+            },
+            3 => {
+                r_temp = p; g_temp = q; b_temp = v;
+            },
+            4 => {
+                r_temp = t; g_temp = p; b_temp = v;
+            },
+            else => {
+                r_temp = v; g_temp = p; b_temp = q;
+            },
+        }
+    }
+
+    // Convert to 0-255 range
+    return .{
+        .r = r_temp * 255,
+        .g = g_temp * 255,
+        .b = b_temp * 255,
+    };
+}
+
 fn writePpmGrad(original: Image(u8), image: Image(Gradient), out_path: []const u8) !void {
     var ppm = try std.fs.cwd().createFile(out_path, .{});
     defer ppm.close();
@@ -757,19 +811,57 @@ fn writePpmGrad(original: Image(u8), image: Image(Gradient), out_path: []const u
                 else => {},
             }
             const mag = val.magnitude;
-            const out = std.math.clamp(mag * 255.0 * 6, 0, 255);
-            const x_mul = @abs(@cos(val.direction));
-            const y_mul = @abs(@sin(val.direction));
-            if (out > 50) {
-                try ppm_writer.writeByte(@intFromFloat(x_mul * out));
-                try ppm_writer.writeByte(@intFromFloat(y_mul * out));
+            const color = hsvToRgb(val.direction, 1, 1);
+            try ppm_writer.writeByte(@intFromFloat(color.r * mag));
+            try ppm_writer.writeByte(@intFromFloat(color.g * mag));
+            try ppm_writer.writeByte(@intFromFloat(color.b * mag));
+        }
+    }
+}
+
+fn writeClusters(clusters: Clusters, image: Image(Gradient), out_path: []const u8) !void {
+    var ppm = try std.fs.cwd().createFile(out_path, .{});
+    defer ppm.close();
+
+    var buf_writer = std.io.bufferedWriter(ppm.writer());
+    defer buf_writer.flush() catch {};
+    var ppm_writer = buf_writer.writer();
+    try ppm_writer.print(
+        \\P6
+        \\{d} {d}
+        \\255
+        \\
+    , .{ image.width, image.calcHeight() });
+
+    std.debug.print("num clusters {d}\n", .{clusters.num_clusters});
+    var it = image.iter();
+    while (it.nextRow()) {
+        while (it.nextCol()) {
+            const val = it.pixel().*;
+            const mag = val.magnitude;
+
+            const cluster_id = clusters.image.pixel(it.x, it.y).*;
+
+            if (cluster_id == 0) {
                 try ppm_writer.writeByte(0);
-            } else {
-                const original_val = original.data[original.width * y + x];
-                try ppm_writer.writeByte(original_val);
-                try ppm_writer.writeByte(original_val);
-                try ppm_writer.writeByte(original_val);
+                try ppm_writer.writeByte(0);
+                try ppm_writer.writeByte(0);
+                continue;
             }
+
+            var cluster_angle: f32 = @floatFromInt((cluster_id * 1) % clusters.num_clusters);
+            cluster_angle *= std.math.pi;
+            cluster_angle /= @floatFromInt(clusters.num_clusters);
+
+            const color = hsvToRgb(cluster_angle, 1, 1);
+            if (false) {
+            try ppm_writer.writeByte(@intFromFloat(color.r * mag));
+            try ppm_writer.writeByte(@intFromFloat(color.g * mag));
+            try ppm_writer.writeByte(@intFromFloat(color.b * mag));
+            }
+            try ppm_writer.writeByte(@intFromFloat(color.r ));
+            try ppm_writer.writeByte(@intFromFloat(color.g ));
+            try ppm_writer.writeByte(@intFromFloat(color.b ));
         }
     }
 }
@@ -958,19 +1050,26 @@ const RleGenerator = struct {
     }
 };
 
+const horizontal_gradient_kernel = StackMat2D(i32, 3, 3){
+    .data = .{
+        -1, 0, 1,
+        -2, 0, 2,
+        -1, 0, 1,
+    },
+};
+
+const vertical_gradient_kernel = StackMat2D(i32, 3, 3){
+    .data = .{
+        -1, -2, -1,
+        0, 0, 0,
+        1, 2, 1,
+    },
+};
+
 fn edgePass1(alloc: std.mem.Allocator, blurry: Image(u8)) !Image(i32) {
     // Find edges
     const edges = try Image(i32).init(alloc, blurry.width, blurry.calcHeight());
     @memset(edges.data, 0);
-
-    const horizontal_gradient_kernel = StackMat2D(i32, 3, 3){
-        .data = .{
-            -1, 0, 1,
-            -2, 0, 2,
-            -1, 0, 1,
-        },
-    };
-
 
     var edges_it = edges.iter();
     std.debug.print("Calculating gradient\n", .{});
@@ -1034,6 +1133,199 @@ fn getNearbyGradient(edges: Image(i32), x: u31, y: u31) ?i32 {
     return null;
 }
 
+const SobelPostOp = struct {
+    pub fn toPixel(in: StackMat2D(i32, 3, 3)) u8 {
+        return @intCast(@abs(in.sum()) / 4);
+    }
+};
+
+fn imageGradient(alloc: std.mem.Allocator, input: Image(u8)) !Image(Gradient) {
+    //const gaussian_blur_kernel = StackMat2D(f32, 5, 5) {
+    //    .data = .{
+    //        1, 4, 6, 4, 1,
+    //        4, 16, 24, 16, 4,
+    //        6, 24, 36, 24, 6,
+    //        4, 16, 24, 16, 4,
+    //        1, 4, 6, 4, 1,
+    //    },
+    //};
+
+    //const BlurPostOp = struct {
+    //    pub fn toPixel(in: anytype) f32 {
+    //        return in.sum() / 256;
+    //    }
+
+    //};
+
+    const mags = try Image(f32).init(alloc, input.width, input.calcHeight());
+    const dirs = try Image(f32).init(alloc, input.width, input.calcHeight());
+    var it = input.iter();
+    while (it.nextRow()) {
+        while (it.nextCol()) {
+            const horizontal_grad = input.applyKernelAtLoc(horizontal_gradient_kernel, it.x, it.y).sum();
+            const vertical_grad = input.applyKernelAtLoc(vertical_gradient_kernel, it.x, it.y).sum();
+            var hf: f32 = @floatFromInt(horizontal_grad);
+            var vf: f32 = @floatFromInt(vertical_grad);
+            // Normalize [0,1]
+            hf /= 255 * 4;
+            vf /= 255 * 4;
+
+            const angle = std.math.atan2(vf, hf);
+            mags.pixel(it.x, it.y).* = std.math.sqrt(hf * hf + vf * vf);
+            dirs.pixel(it.x, it.y).* = @mod(angle, std.math.pi);
+        }
+    }
+
+    //const blurry_mags = try mags.applyKernelToImage(f32, alloc, gaussian_blur_kernel, BlurPostOp);
+    //const blurry_dirs = try dirs.applyKernelToImage(f32, alloc, gaussian_blur_kernel, BlurPostOp);
+
+    const out = try Image(Gradient).init(alloc, input.width, input.calcHeight());
+
+    var out_it = out.iter();
+    while (out_it.nextRow()) {
+        while (out_it.nextCol()) {
+            out_it.pixel().* = .{
+                .magnitude = mags.pixel(out_it.x, out_it.y).*,
+                .direction = dirs.pixel(out_it.x, out_it.y).*,
+            };
+        }
+    }
+
+    return out;
+}
+
+const Point2D = struct {
+    x: u31,
+    y: u31,
+};
+
+const Clusters = struct {
+    num_clusters: usize,
+    image: Image(usize),
+};
+
+fn clusterImageGradient(alloc: std.mem.Allocator, input: Image(Gradient)) !Clusters {
+    var it = input.iter();
+
+    var cluster_id_cache = std.ArrayList(usize).init(alloc);
+    var biggest_cluster_id: usize = 1;
+
+    var cluster_list = std.AutoHashMap(usize, std.AutoHashMap(Point2D, void)).init(alloc);
+
+    const out = try Image(usize).init(alloc, input.width, input.calcHeight());
+    @memset(out.data, 0);
+
+    while (it.nextRow()) {
+        while (it.nextCol()) {
+            const our_gradient = it.pixel().*;
+            const our_cluster = out.pixel(it.x, it.y);
+
+            if (our_gradient.magnitude < 0.05) continue;
+            var cluster_area_it = input.areaIt(it.x, it.y, 5, 5);
+            while (cluster_area_it.nextRow()) {
+                while (cluster_area_it.nextCol()) {
+                    const their_gradient = cluster_area_it.pixel().*;
+                    if (their_gradient.magnitude < 0.05) continue;
+                    if (@abs(our_gradient.direction - their_gradient.direction) < 0.04) {
+                        const their_cluster = out.pixel(cluster_area_it.x, cluster_area_it.y);
+
+                        if (our_cluster.* != 0 and their_cluster.* != 0 and our_cluster.* != their_cluster.*) {
+                            const original_their_cluster = their_cluster.*;
+                            // Could merge, but we are looking for barcodes
+                            // which are square... so we shouldn't need to
+                            // merge disjoint clusters. The geometry should
+                            // prevent any relevant case of this happening
+                            const their_cluster_pixels = cluster_list.getPtr(original_their_cluster);
+                            const our_cluster_pixels = cluster_list.getPtr(our_cluster.*);
+
+                            std.debug.print("Merging {d} and {d}\n", .{our_cluster.*, original_their_cluster});
+
+                            var their_pixel_it = their_cluster_pixels.?.keyIterator();
+                            while (their_pixel_it.next()) |pixel| {
+                                std.debug.assert(out.pixel(pixel.x, pixel.y).* == original_their_cluster);
+                                out.pixel(pixel.x, pixel.y).* = our_cluster.*;
+                                try our_cluster_pixels.?.put(pixel.*, {});
+                            }
+                            std.debug.print("Removing {d} from cluster\n", .{original_their_cluster});
+                            _ = cluster_list.remove(original_their_cluster);
+                            try cluster_id_cache.append(original_their_cluster);
+                        } else if (their_cluster.* == 0 and our_cluster.* == 0) {
+                            const new_cluster_id = if (cluster_id_cache.pop()) |v| v else blk: {
+                                defer biggest_cluster_id += 1;
+                                break :blk biggest_cluster_id;
+                            };
+                            their_cluster.* = new_cluster_id;
+                            our_cluster.* = new_cluster_id;
+                            var new_list = std.AutoHashMap(Point2D, void).init(alloc);
+                            try new_list.put(.{
+                                .x = it.x,
+                                .y = it.y,
+                            }, {});
+                            try new_list.put(.{
+                                .x = cluster_area_it.x,
+                                .y = cluster_area_it.y,
+                            }, {});
+                            std.debug.print("Adding {d} to cluster\n", .{new_cluster_id});
+                            try cluster_list.put(new_cluster_id, new_list);
+                        } else if (their_cluster.* == 0) {
+                            const l = cluster_list.getPtr(our_cluster.*);
+                            try l.?.put(.{
+                                .x = cluster_area_it.x,
+                                .y = cluster_area_it.y,
+                            }, {});
+                            their_cluster.* = our_cluster.*;
+                        } else if (our_cluster.* == 0) {
+                            const l = cluster_list.getPtr(their_cluster.*);
+                            try l.?.put(.{
+                                .x = it.x,
+                                .y = it.y,
+                            }, {});
+                            our_cluster.* = their_cluster.*;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    var removed_cluster_num: usize = 0;
+    for (0..biggest_cluster_id) |id| {
+        if (id == 0) continue;
+        const pixel_list = cluster_list.get(id).?;
+        var pixel_it = pixel_list.keyIterator();
+        while (pixel_it.next()) |pixel| {
+            std.debug.assert(out.pixel(pixel.x, pixel.y).* == id);
+        }
+        if (pixel_list.count() < 1000) {
+            removed_cluster_num += 1;
+            pixel_it = pixel_list.keyIterator();
+            while (pixel_it.next()) |pixel| {
+                out.pixel(pixel.x, pixel.y).* = 0;
+                input.pixel(pixel.x, pixel.y).magnitude = 0;
+            }
+            _ = cluster_list.remove(id);
+        }
+    }
+
+    std.debug.print("Found {d} clusters", .{cluster_list.count()});
+
+    var cluster_it = cluster_list.iterator();
+    while (cluster_it.next()) |entry| {
+        var point_it = entry.value_ptr.keyIterator();
+        while (point_it.next()) |point| {
+            const dir = input.pixel(point.x, point.y).direction;
+            std.debug.print("Average dir: {d}\n", .{dir});
+        }
+    }
+
+
+
+    return .{
+        .num_clusters = biggest_cluster_id,
+        .image = out,
+    };
+}
+
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -1044,6 +1336,12 @@ pub fn main() !void {
     defer image.deinit();
 
     //const gradient = try Image(Gradient).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+
+    const sobel_out = try imageGradient(arena.allocator(), image.inner);
+
+    const clusters = try clusterImageGradient(arena.allocator(), sobel_out);
+    try writePpmGrad(image.inner, sobel_out, "sobel.ppm");
+    try writeClusters(clusters, sobel_out, "clusters.ppm");
 
     const blur_kernel = StackMat2D(u16, 1, 5){
         .data = .{
