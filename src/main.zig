@@ -1284,7 +1284,7 @@ const Clusters = struct {
     image: Image(usize),
 };
 
-fn clusterImageGradient(alloc: std.mem.Allocator, input: Image(Gradient)) !Clusters {
+fn clusterImageGradient(alloc: std.mem.Allocator, input: Image(Gradient), min_cluster_mag: f32, cluster_angle_thresh: f32) !Clusters {
     var it = input.iter();
 
     var cluster_id_cache = std.ArrayList(usize).init(alloc);
@@ -1300,13 +1300,13 @@ fn clusterImageGradient(alloc: std.mem.Allocator, input: Image(Gradient)) !Clust
             const our_gradient = it.pixel().*;
             const our_cluster = out.pixel(it.x, it.y);
 
-            if (our_gradient.magnitude < 0.05) continue;
+            if (our_gradient.magnitude < min_cluster_mag) continue;
             var cluster_area_it = input.areaIt(it.x, it.y, 5, 5);
             while (cluster_area_it.nextRow()) {
                 while (cluster_area_it.nextCol()) {
                     const their_gradient = cluster_area_it.pixel().*;
-                    if (their_gradient.magnitude < 0.05) continue;
-                    if (@abs(our_gradient.direction - their_gradient.direction) < 0.04) {
+                    if (their_gradient.magnitude < min_cluster_mag) continue;
+                    if (@abs(our_gradient.direction - their_gradient.direction) < cluster_angle_thresh) {
                         const their_cluster = out.pixel(cluster_area_it.x, cluster_area_it.y);
 
                         if (our_cluster.* != 0 and their_cluster.* != 0 and our_cluster.* != their_cluster.*) {
@@ -1318,15 +1318,12 @@ fn clusterImageGradient(alloc: std.mem.Allocator, input: Image(Gradient)) !Clust
                             const their_cluster_pixels = cluster_list.getPtr(original_their_cluster);
                             const our_cluster_pixels = cluster_list.getPtr(our_cluster.*);
 
-                            std.debug.print("Merging {d} and {d}\n", .{our_cluster.*, original_their_cluster});
-
                             var their_pixel_it = their_cluster_pixels.?.keyIterator();
                             while (their_pixel_it.next()) |pixel| {
                                 std.debug.assert(out.pixel(pixel.x, pixel.y).* == original_their_cluster);
                                 out.pixel(pixel.x, pixel.y).* = our_cluster.*;
                                 try our_cluster_pixels.?.put(pixel.*, {});
                             }
-                            std.debug.print("Removing {d} from cluster\n", .{original_their_cluster});
                             _ = cluster_list.remove(original_their_cluster);
                             try cluster_id_cache.append(original_their_cluster);
                         } else if (their_cluster.* == 0 and our_cluster.* == 0) {
@@ -1345,7 +1342,6 @@ fn clusterImageGradient(alloc: std.mem.Allocator, input: Image(Gradient)) !Clust
                                 .x = cluster_area_it.x,
                                 .y = cluster_area_it.y,
                             }, {});
-                            std.debug.print("Adding {d} to cluster\n", .{new_cluster_id});
                             try cluster_list.put(new_cluster_id, new_list);
                         } else if (their_cluster.* == 0) {
                             const l = cluster_list.getPtr(our_cluster.*);
@@ -1381,22 +1377,20 @@ fn clusterImageGradient(alloc: std.mem.Allocator, input: Image(Gradient)) !Clust
             pixel_it = pixel_list.keyIterator();
             while (pixel_it.next()) |pixel| {
                 out.pixel(pixel.x, pixel.y).* = 0;
-                input.pixel(pixel.x, pixel.y).magnitude = 0;
             }
             _ = cluster_list.remove(id);
         }
     }
 
-    std.debug.print("Found {d} clusters", .{cluster_list.count()});
+    //std.debug.print("Found {d} clusters", .{cluster_list.count()});
 
-    var cluster_it = cluster_list.iterator();
-    while (cluster_it.next()) |entry| {
-        var point_it = entry.value_ptr.keyIterator();
-        while (point_it.next()) |point| {
-            const dir = input.pixel(point.x, point.y).direction;
-            std.debug.print("Average dir: {d}\n", .{dir});
-        }
-    }
+    //var cluster_it = cluster_list.iterator();
+    //while (cluster_it.next()) |entry| {
+    //    var point_it = entry.value_ptr.keyIterator();
+    //    while (point_it.next()) |point| {
+    //        const dir = input.pixel(point.x, point.y).direction;
+    //    }
+    //}
 
 
 
@@ -1406,9 +1400,17 @@ fn clusterImageGradient(alloc: std.mem.Allocator, input: Image(Gradient)) !Clust
     };
 }
 
-const GuiAction = enum {
-    asdf,
+const GuiAction = union(enum) {
+    update_cluster_mag: f32,
+    update_cluster_angle: f32,
 
+    fn updateClusterMag(val: f32) GuiAction {
+        return .{ .update_cluster_mag = val };
+    }
+
+    fn updateClusterAngle(val: f32) GuiAction {
+        return .{ .update_cluster_angle = val };
+    }
 };
 
 const ImageTexture = struct {
@@ -1477,6 +1479,17 @@ const ImageView = struct {
             .aspect = aspect,
         };
         return ret.asWidget();
+    }
+
+    fn initEmpty(
+        image_renderer: *const sphtud.render.xyuvt_program.ImageRenderer,
+    ) !ImageView {
+        return .{
+            .image_renderer = image_renderer,
+            .tex = .invalid,
+            .width = 0,
+            .aspect = 1.0,
+        };
     }
 
 
@@ -1553,6 +1566,129 @@ fn debugToTexture(out_alloc: *sphtud.render.GlAlloc, scratch: *sphtud.alloc.Scra
     return try sphtud.render.makeTextureFromRgba(out_alloc, @ptrCast(out.data), image.width);
 }
 
+fn initGlParams() void {
+    sphtud.render.gl.glEnable(sphtud.render.gl.GL_MULTISAMPLE);
+    sphtud.render.gl.glEnable(sphtud.render.gl.GL_SCISSOR_TEST);
+    sphtud.render.gl.glBlendFunc(sphtud.render.gl.GL_SRC_ALPHA, sphtud.render.gl.GL_ONE_MINUS_SRC_ALPHA);
+    sphtud.render.gl.glEnable(sphtud.render.gl.GL_BLEND);
+}
+
+const ClusteringResults = struct {
+    sobel_out: Image(Gradient),
+    clusters: Clusters,
+};
+
+const ImageViews = struct {
+    image_alloc: *sphtud.render.GlAlloc,
+    sobel_out: ImageView,
+    clusters: ImageView,
+
+    fn init( gui_alloc: sphtud.ui.GuiAlloc, rgba_renderer: *const sphtud.render.xyuvt_program.ImageRenderer) !ImageViews {
+        const image_alloc = (try gui_alloc.makeSubAlloc("image_textures")).gl;
+        return .{
+            .image_alloc = image_alloc,
+            .sobel_out = try ImageView.initEmpty(rgba_renderer),
+            .clusters = try ImageView.initEmpty(rgba_renderer),
+        };
+    }
+
+    fn update(self: *ImageViews, scratch: *sphtud.alloc.ScratchAlloc, image: Image(u8), results: ClusteringResults) !void {
+        self.image_alloc.reset();
+
+        self.sobel_out.tex =  try gradientToTexture(self.image_alloc, scratch, image, results.sobel_out);
+        self.sobel_out.aspect = @floatFromInt(results.sobel_out.width);
+        self.sobel_out.aspect /= @floatFromInt(results.sobel_out.calcHeight());
+
+        self.clusters.tex = try clustersToTex(
+            self.image_alloc,
+            scratch,
+            results.clusters,
+            results.sobel_out,
+        );
+        self.clusters.aspect = @floatFromInt(results.clusters.image.width);
+        self.clusters.aspect /= @floatFromInt(results.clusters.image.calcHeight());
+    }
+};
+
+const GuiParams = struct {
+    min_cluster_mag: f32 = 0.05,
+    max_cluster_angle: f32 = 0.04,
+
+};
+
+const Gui = struct {
+    image_views: *ImageViews,
+    runner: sphtud.ui.runner.Runner(GuiAction),
+};
+
+fn makeGuiRoot(gui_alloc: sphtud.ui.GuiAlloc, scratch: *sphtud.alloc.ScratchAlloc, gl_scratch: *sphtud.render.GlAlloc, image: Image(u8), gui_params: *const GuiParams) !Gui {
+    var gui_state = try sphtud.ui.widget_factory.widgetState(GuiAction, gui_alloc, scratch, gl_scratch);
+
+    const widget_factory = gui_state.factory(gui_alloc);
+    const root_layout = try widget_factory.makeLayout();
+    const root_widget = try widget_factory.makeScrollView(root_layout.asWidget());
+
+    try root_layout.pushWidget(try widget_factory.makeLabel("Hello world"));
+    const runner = try widget_factory.makeRunner(root_widget);
+
+    const grey_image_renderer = try gui_alloc.heap.arena().create(sphtud.render.xyuvt_program.ImageRenderer);
+    grey_image_renderer.* = try sphtud.render.xyuvt_program.ImageRenderer.init(gui_alloc.gl, .greyscale);
+
+    const image_views = try gui_alloc.heap.arena().create(ImageViews);
+    image_views.* = try ImageViews.init(gui_alloc, &gui_state.image_renderer);
+
+    try root_layout.pushWidget(try ImageView.init(gui_alloc, grey_image_renderer, image));
+
+
+    // FIXME: Attach results to own allocator to nuke on parameter change
+
+    try root_layout.pushWidget(image_views.sobel_out.asWidget());
+
+
+    try root_layout.pushWidget(try widget_factory.makeLabel("Clusters"));
+    try root_layout.pushWidget(try widget_factory.makeLabel("Min cluster magnitude"));
+    try root_layout.pushWidget(try widget_factory.makeDragFloat(
+        &gui_params.min_cluster_mag,
+        &GuiAction.updateClusterMag,
+        0.001,
+    ));
+
+    try root_layout.pushWidget(try widget_factory.makeLabel("Max cluster angle"));
+    try root_layout.pushWidget(try widget_factory.makeDragFloat(
+        &gui_params.max_cluster_angle,
+        &GuiAction.updateClusterAngle,
+        0.001,
+    ));
+
+    try root_layout.pushWidget(image_views.clusters.asWidget());
+
+
+    return .{
+        .image_views = image_views,
+        .runner = runner,
+    };
+}
+
+fn makeClusters(scratch: *sphtud.alloc.ScratchAlloc, image: Image(u8), gui_params: GuiParams) !ClusteringResults {
+
+    const sobel_out = try imageGradient(scratch.allocator(), image);
+
+    const clusters = try clusterImageGradient(scratch.allocator(), sobel_out, gui_params.min_cluster_mag, gui_params.max_cluster_angle,);
+    return .{
+        .sobel_out = sobel_out,
+        .clusters = clusters,
+    };
+}
+
+fn updateImageViews(scratch: *sphtud.alloc.ScratchAlloc, image: Image(u8), gui_params: GuiParams, image_views: *ImageViews) !void {
+    const results = makeClusters(scratch, image, gui_params) catch |e| {
+        std.debug.print("{s}\n", .{@errorName(e)});
+        std.debug.print("{}\n", .{@errorReturnTrace().?});
+        return;
+    };
+    try image_views.update(scratch, image, results);
+}
+
 pub fn main() !void {
     var window: sphtud.window.Window = undefined;
     try window.initPinned("barcode-scanner", 800, 600);
@@ -1572,20 +1708,8 @@ pub fn main() !void {
         .gl = &render_alloc,
     };
 
-    sphtud.render.gl.glEnable(sphtud.render.gl.GL_MULTISAMPLE);
-    sphtud.render.gl.glEnable(sphtud.render.gl.GL_SCISSOR_TEST);
-    sphtud.render.gl.glBlendFunc(sphtud.render.gl.GL_SRC_ALPHA, sphtud.render.gl.GL_ONE_MINUS_SRC_ALPHA);
-    sphtud.render.gl.glEnable(sphtud.render.gl.GL_BLEND);
 
-
-    var gui_state = try sphtud.ui.widget_factory.widgetState(GuiAction, gui_alloc, &scratch, &gl_scratch);
-
-    const widget_factory = gui_state.factory(gui_alloc);
-    const root_layout = try widget_factory.makeLayout();
-    const root_widget = try widget_factory.makeScrollView(root_layout.asWidget());
-
-    try root_layout.pushWidget(try widget_factory.makeLabel("Hello world"));
-    var runner = try widget_factory.makeRunner(root_widget);
+    initGlParams();
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -1597,11 +1721,42 @@ pub fn main() !void {
 
     //const gradient = try Image(Gradient).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
 
-    const sobel_out = try imageGradient(arena.allocator(), image.inner);
+    var gui_params = GuiParams{};
+    var gui = try makeGuiRoot(gui_alloc, &scratch, &gl_scratch, image.inner, &gui_params);
+    const runner = &gui.runner;
+    const image_views = gui.image_views;
 
-    const clusters = try clusterImageGradient(arena.allocator(), sobel_out);
-    try writePpmGrad(image.inner, sobel_out, "sobel.ppm");
-    try writeClusters(clusters, sobel_out, "clusters.ppm");
+    try updateImageViews(&scratch, image.inner, gui_params, image_views);
+
+    while (!window.closed()) {
+        scratch.reset();
+        gl_scratch.reset();
+
+        const window_width, const window_height = window.getWindowSize();
+
+        sphtud.render.gl.glClear(sphtud.render.gl.GL_COLOR_BUFFER_BIT);
+
+        sphtud.render.gl.glViewport(0, 0, @intCast(window_width), @intCast(window_height));
+        sphtud.render.gl.glScissor(0, 0, @intCast(window_width), @intCast(window_height));
+
+        const action = try runner.step(1.0, .{
+            .width = @intCast(window_width),
+            .height = @intCast(window_height),
+        }, &window.queue);
+
+        if (action.action) |a| switch (a) {
+            .update_cluster_mag => |v| {
+                gui_params.min_cluster_mag = @max(v, 0);
+                try updateImageViews(&scratch, image.inner, gui_params, image_views);
+            },
+            .update_cluster_angle => |v| {
+                gui_params.max_cluster_angle = @max(v, 0);
+                try updateImageViews(&scratch, image.inner, gui_params, image_views);
+            },
+        };
+
+        window.swapBuffers();
+    }
 
     const blur_kernel = StackMat2D(u16, 1, 5){
         .data = .{
@@ -1694,40 +1849,6 @@ pub fn main() !void {
             bcs.consumeLight(&scan_it);
         }
         std.debug.assert(x == rle_back_and_forth.width);
-    }
-
-    const grey_image_renderer = try sphtud.render.xyuvt_program.ImageRenderer.init(gui_alloc.gl, .greyscale);
-    try root_layout.pushWidget(try ImageView.init(gui_alloc, &grey_image_renderer, image.inner));
-
-    try root_layout.pushWidget(try ImageView.init(gui_alloc, &grey_image_renderer, blurry));
-
-    const debug_tex = try debugToTexture(&render_alloc, &scratch, image.inner, debug);
-    try root_layout.pushWidget(try ImageView.initTex(gui_alloc, &gui_state.image_renderer, debug_tex, debug.width, debug.calcHeight()));
-
-    const sobel_tex = try gradientToTexture(&render_alloc, &scratch, image.inner, sobel_out);
-    try root_layout.pushWidget(try ImageView.initTex(gui_alloc, &gui_state.image_renderer, sobel_tex, sobel_out.width, sobel_out.calcHeight()));
-
-    const clusters_tex = try clustersToTex(&render_alloc, &scratch, clusters, sobel_out);
-    try root_layout.pushWidget(try ImageView.initTex(gui_alloc, &gui_state.image_renderer, clusters_tex, clusters.image.width, clusters.image.calcHeight()));
-
-    while (!window.closed()) {
-        scratch.reset();
-        gl_scratch.reset();
-
-        const window_width, const window_height = window.getWindowSize();
-
-        sphtud.render.gl.glClear(sphtud.render.gl.GL_COLOR_BUFFER_BIT);
-
-        sphtud.render.gl.glViewport(0, 0, @intCast(window_width), @intCast(window_height));
-        sphtud.render.gl.glScissor(0, 0, @intCast(window_width), @intCast(window_height));
-
-        std.debug.print("{d}x{d}\n", .{window_width, window_height});
-        const action = try runner.step(1.0, .{
-            .width = @intCast(window_width),
-            .height = @intCast(window_height),
-        }, &window.queue);
-        std.debug.print("{any}\n", .{action});
-        window.swapBuffers();
     }
 
 
