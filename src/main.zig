@@ -12,6 +12,46 @@ const StbiImage = struct {
     }
 };
 
+const target_width = 256;
+
+const ImageSize = struct {
+    width: u31,
+    height: u31,
+};
+
+fn getTargetSize(in: Image(u8)) ImageSize {
+    const in_height = in.calcHeight();
+    if (in_height > in.width) {
+        return .{
+            .width = in.width * target_width / in_height,
+            .height = target_width,
+        };
+    } else {
+        return .{
+            .width = target_width,
+            .height = in_height * target_width / in.width,
+        };
+    }
+}
+
+fn initialResize(alloc: std.mem.Allocator, in: Image(u8)) !Image(u8) {
+    const target_size = getTargetSize(in);
+    std.debug.print("{any}\n", .{target_size});
+    const ret = try Image(u8).init(alloc, target_size.width, target_size.height);
+
+    const in_height = in.calcHeight();
+
+    var it = ret.iter();
+    while (it.nextPixel()) {
+        it.pixel().* = in.pixel(
+            it.x * in.width / target_size.width,
+            it.y * in_height / target_size.height,
+        ).*;
+    }
+
+    return ret;
+}
+
 // FIXME: Generalized image kernel
 
 fn loadImage(path: [:0]const u8) !StbiImage {
@@ -760,7 +800,7 @@ fn hsvToRgb(h: f32, s: f32, v: f32) Rgb {
     var r_temp: f32 = undefined;
     var g_temp: f32 = undefined;
     var b_temp: f32 = undefined;
-    std.debug.assert(h >= 0 and h < std.math.pi);
+    std.debug.assert(h >= 0 and h <= std.math.pi);
 
     if (s == 0) {
         r_temp = v;
@@ -843,7 +883,7 @@ fn writePpmGrad(original: Image(u8), image: Image(Gradient), out_path: []const u
                 },
                 else => {},
             }
-            const mag = val.magnitude;
+            const mag = val.length2();
             const color = hsvToRgb(val.direction, 1, 1);
             try ppm_writer.writeByte(@intFromFloat(color.r * mag));
             try ppm_writer.writeByte(@intFromFloat(color.g * mag));
@@ -865,12 +905,10 @@ fn gradientToTexture(gl_alloc: *sphtud.render.GlAlloc, scratch: *sphtud.alloc.Sc
                 unreachable;
             },
             else => blk: {
-                const mag = val.magnitude;
-                const color = hsvToRgb(val.direction, 1, 1);
                 break :blk .{
-                    .r = @intFromFloat(color.r * mag),
-                    .g = @intFromFloat(color.g * mag),
-                    .b = @intFromFloat(color.b * mag),
+                    .r = @intFromFloat(@abs(val.v[0] * 255)),
+                    .g = @intFromFloat(@abs(val.v[1] * 255)),
+                    .b = 0,
                     .a = 255,
                 };
             },
@@ -901,7 +939,7 @@ fn writeClusters(clusters: Clusters, image: Image(Gradient), out_path: []const u
     while (it.nextRow()) {
         while (it.nextCol()) {
             const val = it.pixel().*;
-            const mag = val.magnitude;
+            const mag = val.length2();
 
             const cluster_id = clusters.image.pixel(it.x, it.y).*;
 
@@ -943,7 +981,7 @@ fn clustersToTex(gl_alloc: *sphtud.render.GlAlloc, scratch: *sphtud.alloc.Scratc
     while (it.nextRow()) {
         while (it.nextCol()) {
             const val = it.pixel().*;
-            var mag = val.magnitude;
+            var mag = sphtud.math.length2(val.v);
             const cluster_id = clusters.image.pixel(it.x, it.y).*;
 
             if (cluster_id == 0) {
@@ -959,7 +997,11 @@ fn clustersToTex(gl_alloc: *sphtud.render.GlAlloc, scratch: *sphtud.alloc.Scratc
 
             if (selected_point) |sp| {
                 if (sp.x == it.x and sp.y == it.y) {
-                    color = .{ .r = 0, .g = 255, .b = 255, };
+                    color = .{
+                        .r = 0,
+                        .g = 255,
+                        .b = 255,
+                    };
                 }
             }
 
@@ -1039,9 +1081,14 @@ fn writeEdgePass1(original: Image(u8), edges: Image(i32), out_path: []const u8) 
 
 const Gradient = struct {
     // radians[0, 2pi],
-    direction: f32,
-    magnitude: f32,
+    //direction: f32,
+    //magnitude: f32,
+    v: sphtud.math.Vec2,
     confidence: enum { no, maybe, yes } = .yes,
+
+    fn angle(self: Gradient) f32 {
+        return std.math.atan2(self.v[1], self.v[0]);
+    }
 };
 
 const lower_thresh = 0.05;
@@ -1266,8 +1313,8 @@ fn imageGradient(alloc: std.mem.Allocator, input: Image(u8)) !Image(Gradient) {
 
     //};
 
-    const mags = try Image(f32).init(alloc, input.width, input.calcHeight());
-    const dirs = try Image(f32).init(alloc, input.width, input.calcHeight());
+    const out = try Image(Gradient).init(alloc, input.width, input.calcHeight());
+
     var it = input.iter();
     while (it.nextRow()) {
         while (it.nextCol()) {
@@ -1279,23 +1326,13 @@ fn imageGradient(alloc: std.mem.Allocator, input: Image(u8)) !Image(Gradient) {
             hf /= 255 * 4;
             vf /= 255 * 4;
 
-            const angle = std.math.atan2(vf, hf);
-            mags.pixel(it.x, it.y).* = std.math.sqrt(hf * hf + vf * vf);
-            dirs.pixel(it.x, it.y).* = @mod(angle, std.math.pi);
-        }
-    }
+            if (vf < 0) {
+                hf = -hf;
+                vf = -vf;
+            }
 
-    //const blurry_mags = try mags.applyKernelToImage(f32, alloc, gaussian_blur_kernel, BlurPostOp);
-    //const blurry_dirs = try dirs.applyKernelToImage(f32, alloc, gaussian_blur_kernel, BlurPostOp);
-
-    const out = try Image(Gradient).init(alloc, input.width, input.calcHeight());
-
-    var out_it = out.iter();
-    while (out_it.nextRow()) {
-        while (out_it.nextCol()) {
-            out_it.pixel().* = .{
-                .magnitude = mags.pixel(out_it.x, out_it.y).*,
-                .direction = dirs.pixel(out_it.x, out_it.y).*,
+            out.pixel(it.x, it.y).* = .{
+                .v = .{ hf, vf },
             };
         }
     }
@@ -1325,7 +1362,7 @@ fn Timer(comptime max_elems: comptime_int) type {
         const Self = @This();
 
         fn init() !Self {
-            var ret = Self {};
+            var ret = Self{};
             try ret.markStart("start");
             return ret;
         }
@@ -1347,10 +1384,9 @@ fn Timer(comptime max_elems: comptime_int) type {
                 const end = times[i + 1];
 
                 const elapsed_ms = end.time.since(start.time) / std.time.ns_per_ms;
-                std.debug.print("{s} took {d}ms\n", .{start.name, elapsed_ms});
+                std.debug.print("{s} took {d}ms\n", .{ start.name, elapsed_ms });
             }
         }
-
     };
 }
 
@@ -1364,10 +1400,9 @@ const Clusterer = struct {
     it: PixelIter(Gradient),
     num_pixels_visited: usize = 0,
     min_cluster_mag: f32,
-    cluster_angle_thresh: f32,
+    min_cluster_similarity: f32,
 
-
-    pub fn init(alloc: std.mem.Allocator, input: Image(Gradient), min_cluster_mag: f32, cluster_angle_thresh: f32) !Clusterer {
+    pub fn init(alloc: std.mem.Allocator, input: Image(Gradient), min_cluster_mag: f32, min_cluster_similarity: f32) !Clusterer {
         const out = try Image(usize).init(alloc, input.width, input.calcHeight());
         @memset(out.data, 0);
 
@@ -1381,7 +1416,7 @@ const Clusterer = struct {
             .out = out,
             .num_pixels_visited = 0,
             .min_cluster_mag = min_cluster_mag,
-            .cluster_angle_thresh = cluster_angle_thresh,
+            .min_cluster_similarity = min_cluster_similarity,
         };
     }
 
@@ -1396,15 +1431,20 @@ const Clusterer = struct {
         const our_gradient = self.it.pixel().*;
         const our_cluster = self.out.pixel(self.it.x, self.it.y);
 
-        if (our_gradient.magnitude < self.min_cluster_mag) return true;
+        if (sphtud.math.length2(our_gradient.v) < self.min_cluster_mag) return true;
         var cluster_area_it = self.input.areaItStartEnd(self.it.x, self.it.x + 2, self.it.y, self.it.y + 2);
         while (cluster_area_it.nextPixel()) {
             self.num_pixels_visited += 1;
 
             const their_gradient = cluster_area_it.pixel().*;
-            if (their_gradient.magnitude < self.min_cluster_mag) continue;
+            if (sphtud.math.length2(their_gradient.v) < self.min_cluster_mag) continue;
             // FIXME: if 89 degrees we should consider those close
-            if (@abs(our_gradient.direction - their_gradient.direction) < self.cluster_angle_thresh) {
+            const similarity = @abs(sphtud.math.dot(
+                sphtud.math.normalize(our_gradient.v),
+                sphtud.math.normalize(their_gradient.v),
+            ));
+
+            if (similarity > self.min_cluster_similarity) {
                 const their_cluster = self.out.pixel(cluster_area_it.x, cluster_area_it.y);
 
                 if (our_cluster.* != 0 and their_cluster.* != 0 and our_cluster.* != their_cluster.*) {
@@ -1468,36 +1508,29 @@ fn downsampleImage(alloc: std.mem.Allocator, input: anytype, divisor: u31) !@Typ
     const T = @TypeOf(input);
     var ret = try T.init(alloc, input.width / divisor, input.calcHeight() / divisor);
     @memset(ret.data, .{
-        .magnitude = 0,
-        .direction = 0,
+        .v = .{ 0, 0 },
     });
 
     var it = ret.iter();
-    while (it.nextRow()) {
-        while (it.nextCol()) {
-            var input_it = input.areaItStartEnd(it.x * divisor, (it.x + 1) * divisor, it.y * divisor, (it.y + 1) * divisor);
-            var max: Gradient = .{
-                .magnitude = 0,
-                .direction = 0,
-            };
-            while (input_it.nextPixel()) {
-                if (input_it.pixel().magnitude > max.magnitude) {
-                    max = input_it.pixel().*;
-
-                }
+    while (it.nextPixel()) {
+        var input_it = input.areaItStartEnd(it.x * divisor, (it.x + 1) * divisor, it.y * divisor, (it.y + 1) * divisor);
+        var max: Gradient = .{ .v = .{ 0, 0 } };
+        while (input_it.nextPixel()) {
+            if (sphtud.math.length2(input_it.pixel().v) > sphtud.math.length2(max.v)) {
+                max = input_it.pixel().*;
             }
-            it.pixel().* = max;
         }
+        it.pixel().* = max;
     }
 
     return ret;
 }
 
-fn clusterImageGradient(alloc: std.mem.Allocator, input: Image(Gradient), min_cluster_mag: f32, cluster_angle_thresh: f32) !Clusters {
+fn clusterImageGradient(alloc: std.mem.Allocator, input: Image(Gradient), min_cluster_mag: f32, min_cluster_similarity: f32, min_cluster_size: usize) !Clusters {
     var timer = try Timer(10).init();
 
     try timer.markStart("clustering");
-    var clusterer = try Clusterer.init(alloc, input, min_cluster_mag, cluster_angle_thresh);
+    var clusterer = try Clusterer.init(alloc, input, min_cluster_mag, min_cluster_similarity);
 
     while (try clusterer.step()) {}
 
@@ -1513,7 +1546,7 @@ fn clusterImageGradient(alloc: std.mem.Allocator, input: Image(Gradient), min_cl
         while (pixel_it.next()) |pixel| {
             std.debug.assert(clusterer.out.pixel(pixel.x, pixel.y).* == id);
         }
-        if (pixel_list.count() < 1000) {
+        if (pixel_list.count() < min_cluster_size) {
             removed_cluster_num += 1;
             pixel_it = pixel_list.keyIterator();
             while (pixel_it.next()) |pixel| {
@@ -1658,7 +1691,7 @@ const ImageView = struct {
     fn render(ctx: ?*anyopaque, widget_bounds: sphtud.ui.PixelBBox, window_bounds: sphtud.ui.PixelBBox) void {
         const self: *ImageView = @ptrCast(@alignCast(ctx));
         const transform = sphtud.ui.util.widgetToClipTransform(widget_bounds, window_bounds);
-        self.image_renderer.renderTexture(self.tex, sphtud.math.Transform.scale( 1, -1).then(transform));
+        self.image_renderer.renderTexture(self.tex, sphtud.math.Transform.scale(1, -1).then(transform));
     }
 
     fn getSize(ctx: ?*anyopaque) sphtud.ui.PixelSize {
@@ -1719,13 +1752,15 @@ fn initGlParams() void {
 }
 
 const ClusteringResults = struct {
-    sobel_out: Image(Gradient),
+    sobel: Image(Gradient),
+    low_res_sobel: Image(Gradient),
     clusters: Clusters,
 };
 
 const ImageViews = struct {
     image_alloc: *sphtud.render.GlAlloc,
-    sobel_out: ImageView,
+    sobel: ImageView,
+    low_res_sobel: ImageView,
     clusters: ImageView,
 
     debug_alloc: *sphtud.render.GlAlloc,
@@ -1736,7 +1771,8 @@ const ImageViews = struct {
         const debug_alloc = (try gui_alloc.makeSubAlloc("debug_cluster")).gl;
         return .{
             .image_alloc = image_alloc,
-            .sobel_out = try ImageView.initEmpty(rgba_renderer),
+            .sobel = try ImageView.initEmpty(rgba_renderer),
+            .low_res_sobel = try ImageView.initEmpty(rgba_renderer),
             .clusters = try ImageView.initEmpty(rgba_renderer),
             .debug_alloc = debug_alloc,
             .debug_cluster = try ImageView.initEmpty(rgba_renderer),
@@ -1746,19 +1782,23 @@ const ImageViews = struct {
     fn update(self: *ImageViews, scratch: *sphtud.alloc.ScratchAlloc, results: ClusteringResults) !void {
         self.image_alloc.reset();
         errdefer {
-            self.sobel_out.tex = .invalid;
+            self.sobel.tex = .invalid;
             self.clusters.tex = .invalid;
         }
 
-        self.sobel_out.tex = try gradientToTexture(self.image_alloc, scratch, results.sobel_out);
-        self.sobel_out.aspect = @floatFromInt(results.sobel_out.width);
-        self.sobel_out.aspect /= @floatFromInt(results.sobel_out.calcHeight());
+        self.sobel.tex = try gradientToTexture(self.image_alloc, scratch, results.sobel);
+        self.sobel.aspect = @floatFromInt(results.sobel.width);
+        self.sobel.aspect /= @floatFromInt(results.sobel.calcHeight());
+
+        self.low_res_sobel.tex = try gradientToTexture(self.image_alloc, scratch, results.low_res_sobel);
+        self.low_res_sobel.aspect = @floatFromInt(results.low_res_sobel.width);
+        self.low_res_sobel.aspect /= @floatFromInt(results.low_res_sobel.calcHeight());
 
         self.clusters.tex = try clustersToTex(
             self.image_alloc,
             scratch,
             results.clusters,
-            results.sobel_out,
+            results.low_res_sobel,
             null,
         );
         self.clusters.aspect = @floatFromInt(results.clusters.image.width);
@@ -1782,8 +1822,8 @@ const ImageViews = struct {
 };
 
 const GuiParams = struct {
-    min_cluster_mag: f32 = 0.05,
-    max_cluster_angle: f32 = 0.04,
+    min_cluster_mag: f32 = 0.02,
+    min_cluster_similarity: f32 = 0.95,
     step_size: f32 = 1.0,
 };
 
@@ -1799,7 +1839,6 @@ fn makeGuiRoot(gui_alloc: sphtud.ui.GuiAlloc, scratch: *sphtud.alloc.ScratchAllo
     const root_layout = try widget_factory.makeLayout();
     const root_widget = try widget_factory.makeScrollView(root_layout.asWidget());
 
-    try root_layout.pushWidget(try widget_factory.makeLabel("Hello world"));
     const runner = try widget_factory.makeRunner(root_widget);
 
     const grey_image_renderer = try gui_alloc.heap.arena().create(sphtud.render.xyuvt_program.ImageRenderer);
@@ -1808,11 +1847,16 @@ fn makeGuiRoot(gui_alloc: sphtud.ui.GuiAlloc, scratch: *sphtud.alloc.ScratchAllo
     const image_views = try gui_alloc.heap.arena().create(ImageViews);
     image_views.* = try ImageViews.init(gui_alloc, &gui_state.image_renderer);
 
+    try root_layout.pushWidget(try widget_factory.makeLabel("Resized initial image"));
     try root_layout.pushWidget(try ImageView.init(gui_alloc, grey_image_renderer, image));
 
     // FIXME: Attach results to own allocator to nuke on parameter change
 
-    try root_layout.pushWidget(image_views.sobel_out.asWidget());
+    try root_layout.pushWidget(try widget_factory.makeLabel("Sobel"));
+    try root_layout.pushWidget(image_views.sobel.asWidget());
+
+    try root_layout.pushWidget(try widget_factory.makeLabel("Sobel low res"));
+    try root_layout.pushWidget(image_views.low_res_sobel.asWidget());
 
     try root_layout.pushWidget(try widget_factory.makeLabel("Clusters"));
     try root_layout.pushWidget(try widget_factory.makeLabel("Min cluster magnitude"));
@@ -1824,7 +1868,7 @@ fn makeGuiRoot(gui_alloc: sphtud.ui.GuiAlloc, scratch: *sphtud.alloc.ScratchAllo
 
     try root_layout.pushWidget(try widget_factory.makeLabel("Max cluster angle"));
     try root_layout.pushWidget(try widget_factory.makeDragFloat(
-        &gui_params.max_cluster_angle,
+        &gui_params.min_cluster_similarity,
         &GuiAction.updateClusterAngle,
         0.001,
     ));
@@ -1832,13 +1876,13 @@ fn makeGuiRoot(gui_alloc: sphtud.ui.GuiAlloc, scratch: *sphtud.alloc.ScratchAllo
     try root_layout.pushWidget(image_views.clusters.asWidget());
 
     try root_layout.pushWidget(try widget_factory.makeLabel("Debug cluster view"));
-    try root_layout.pushWidget(try widget_factory.makeButton("Step", GuiAction { .step_cluster = {} }));
-    try root_layout.pushWidget(try widget_factory.makeButton("Reset", GuiAction { .reset_cluster = {} }));
+    try root_layout.pushWidget(try widget_factory.makeButton("Step", GuiAction{ .step_cluster = {} }));
+    try root_layout.pushWidget(try widget_factory.makeButton("Reset", GuiAction{ .reset_cluster = {} }));
     try root_layout.pushWidget(try widget_factory.makeLabel("Step size"));
     try root_layout.pushWidget(try widget_factory.makeDragFloat(
-            &gui_params.step_size,
-            &GuiAction.updateStepSize,
-            0.1,
+        &gui_params.step_size,
+        &GuiAction.updateStepSize,
+        0.1,
     ));
     try root_layout.pushWidget(image_views.debug_cluster.asWidget());
 
@@ -1848,18 +1892,21 @@ fn makeGuiRoot(gui_alloc: sphtud.ui.GuiAlloc, scratch: *sphtud.alloc.ScratchAllo
     };
 }
 
+const gradient_downsample_factor = 6;
 fn makeClusters(scratch: *sphtud.alloc.ScratchAlloc, image: Image(u8), gui_params: GuiParams) !ClusteringResults {
     const sobel_out = try imageGradient(scratch.allocator(), image);
 
-    const sobel_resized = try downsampleImage(scratch.allocator(), sobel_out, 3);
+    const sobel_resized = try downsampleImage(scratch.allocator(), sobel_out, gradient_downsample_factor);
     const clusters = try clusterImageGradient(
         scratch.allocator(),
         sobel_resized,
         gui_params.min_cluster_mag,
-        gui_params.max_cluster_angle,
+        gui_params.min_cluster_similarity,
+        sobel_resized.width * sobel_resized.calcHeight() / 10,
     );
     return .{
-        .sobel_out = sobel_resized,
+        .sobel = sobel_out,
+        .low_res_sobel = sobel_resized,
         .clusters = clusters,
     };
 }
@@ -1887,22 +1934,30 @@ pub fn main() !void {
 
     const path = (try std.process.argsAlloc(arena.allocator()))[1];
 
-    const image = try loadImage(path);
-    defer image.deinit();
+    const image = blk: {
+        const image = try loadImage(path);
+        defer image.deinit();
+
+        break :blk try initialResize(arena.allocator(), image.inner);
+    };
 
     //const gradient = try Image(Gradient).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
 
     var gui_params = GuiParams{};
-    var gui = try makeGuiRoot(try allocators.root_render.makeSubAlloc("gui"), &allocators.scratch, &allocators.scratch_gl, image.inner, &gui_params);
+    var gui = try makeGuiRoot(try allocators.root_render.makeSubAlloc("gui"), &allocators.scratch, &allocators.scratch_gl, image, &gui_params);
     const runner = &gui.runner;
     const image_views = gui.image_views;
 
-    try updateImageViews(&allocators.scratch, image.inner, gui_params, image_views);
+    try updateImageViews(&allocators.scratch, image, gui_params, image_views);
 
-    const debug_cluster_sobel = try imageGradient(allocators.root.arena(), image.inner);
+    const debug_cluster_sobel = try downsampleImage(
+        allocators.root.arena(),
+        try imageGradient(allocators.scratch.allocator(), image),
+        gradient_downsample_factor,
+    );
 
     const clusterer_alloc = try allocators.root.makeSubAlloc("clusterer");
-    var clusterer = try Clusterer.init(clusterer_alloc.arena(), debug_cluster_sobel, gui_params.min_cluster_mag, gui_params.max_cluster_angle);
+    var clusterer = try Clusterer.init(clusterer_alloc.arena(), debug_cluster_sobel, gui_params.min_cluster_mag, gui_params.min_cluster_similarity);
 
     while (!window.closed()) {
         allocators.resetScratch();
@@ -1922,24 +1977,24 @@ pub fn main() !void {
         if (action.action) |a| switch (a) {
             .update_cluster_mag => |v| {
                 gui_params.min_cluster_mag = @max(v, 0);
-                updateImageViews(&allocators.scratch, image.inner, gui_params, image_views) catch {};
+                updateImageViews(&allocators.scratch, image, gui_params, image_views) catch {};
 
                 try clusterer_alloc.reset();
-                clusterer = try Clusterer.init(clusterer_alloc.arena(), debug_cluster_sobel, gui_params.min_cluster_mag, gui_params.max_cluster_angle);
+                clusterer = try Clusterer.init(clusterer_alloc.arena(), debug_cluster_sobel, gui_params.min_cluster_mag, gui_params.min_cluster_similarity);
             },
             .update_cluster_angle => |v| {
-                gui_params.max_cluster_angle = @max(v, 0);
-                updateImageViews(&allocators.scratch, image.inner, gui_params, image_views) catch {};
+                gui_params.min_cluster_similarity = @max(v, 0);
+                updateImageViews(&allocators.scratch, image, gui_params, image_views) catch {};
 
                 try clusterer_alloc.reset();
-                clusterer = try Clusterer.init(clusterer_alloc.arena(), debug_cluster_sobel, gui_params.min_cluster_mag, gui_params.max_cluster_angle);
+                clusterer = try Clusterer.init(clusterer_alloc.arena(), debug_cluster_sobel, gui_params.min_cluster_mag, gui_params.min_cluster_similarity);
             },
             .update_step_size => |v| {
                 gui_params.step_size = @round(@max(v, 0));
             },
             .reset_cluster => {
                 try clusterer_alloc.reset();
-                clusterer = try Clusterer.init(clusterer_alloc.arena(), debug_cluster_sobel, gui_params.min_cluster_mag, gui_params.max_cluster_angle);
+                clusterer = try Clusterer.init(clusterer_alloc.arena(), debug_cluster_sobel, gui_params.min_cluster_mag, gui_params.min_cluster_similarity);
                 for (0..1100) |_| {
                     _ = try clusterer.step();
                 }
@@ -1976,7 +2031,7 @@ pub fn main() !void {
         }
     };
 
-    const blurry = try image.inner.applyKernelToImage(
+    const blurry = try image.applyKernelToImage(
         u8,
         arena.allocator(),
         blur_kernel,
@@ -1986,17 +2041,17 @@ pub fn main() !void {
     try writePpmu8(blurry, "blurry.ppm");
 
     // FIXME: Fold into edge data
-    const gradients = try Image(i32).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+    const gradients = try Image(i32).init(arena.allocator(), image.width, image.calcHeight());
     @memset(gradients.data, 0);
 
     // Output debug image from edges / RLE info
-    const rle_back_and_forth = try Image(u8).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+    const rle_back_and_forth = try Image(u8).init(arena.allocator(), image.width, image.calcHeight());
 
-    const debug = try Image(DebugPurpose).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+    const debug = try Image(DebugPurpose).init(arena.allocator(), image.width, image.calcHeight());
     @memset(debug.data, .none);
 
     const edges = try edgePass1(arena.allocator(), blurry);
-    const edges2 = try Image(u32).init(arena.allocator(), image.inner.width, image.inner.calcHeight());
+    const edges2 = try Image(u32).init(arena.allocator(), image.width, image.calcHeight());
     @memset(edges2.data, 0);
 
     var it = edges2.iter();
@@ -2004,7 +2059,7 @@ pub fn main() !void {
         var row_rle = RleGenerator.init(arena.allocator());
 
         while (it.nextCol()) {
-            row_rle.pushPixel(image.inner.pixel(it.x, it.y).*);
+            row_rle.pushPixel(image.pixel(it.x, it.y).*);
 
             const gradient = edges.pixel(it.x, it.y).*;
             if (gradient != 0) {
@@ -2050,8 +2105,8 @@ pub fn main() !void {
         std.debug.assert(x == rle_back_and_forth.width);
     }
 
-    try writeEdgePass1(image.inner, edges, "edges.ppm");
-    try writeEdges(image.inner, edges2, "edges2.ppm");
+    try writeEdgePass1(image, edges, "edges.ppm");
+    try writeEdges(image, edges2, "edges2.ppm");
     try writePpmu8(rle_back_and_forth, "rle.ppm");
     try writeDebug(rle_back_and_forth, debug);
 
